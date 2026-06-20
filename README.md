@@ -1,6 +1,6 @@
 # CTRL-Modem
 
-**A modern web UI for cellular modems on OpenWRT. Replaces LuCI entirely.**
+**A modern web UI for cellular modems on OpenWRT. Does not work inside LuCI, so you don't need LuCI installed.**
 
 CTRL-Modem is a standalone web interface for managing cellular (4G/5G) modems on
 OpenWRT routers. It replaces LuCI's network screens for modem management with a
