@@ -1,0 +1,14 @@
+
+config modem-interface 'settings'
+	option enabled '1'
+	option listen_addr '0.0.0.0:8080'
+	option signal_poll_interval '2'
+	option log_level 'info'
+
+config modem-interface 'network'
+	option apn 'broadband'
+	option auto_connect '0'
+
+config modem-interface 'update'
+	option auto_update '1'
+	option check_interval '168'

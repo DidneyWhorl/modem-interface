@@ -1,0 +1,809 @@
+#!/bin/sh
+# modem-interface-update - Check for and apply modem-interface package updates
+#
+# Usage:
+#   modem-interface-update check    # Check if update available (exit 0=yes, 1=no, 2=error)
+#   modem-interface-update apply    # Check and apply update if available
+#   modem-interface-update version  # Print installed and available versions as JSON
+
+set -e
+
+LOCKFILE="/var/lock/modem-interface-update.lock"
+LOGFILE="/var/log/modem-interface-update.log"
+STATUS_FILE="/tmp/modem-interface-update-status.json"
+PKG_NAME="modem-interface"
+FEED_NAME="modem_interface"
+MAX_LOG_LINES=500
+
+# Detect package manager: apk takes precedence on 24.10+
+if command -v apk >/dev/null 2>&1; then
+    PKG_MGR="apk"
+else
+    PKG_MGR="opkg"
+fi
+
+# Auto-detect feed cache directory.
+# For apk: use a dedicated temp cache since apk doesn't have an equivalent of opkg-lists.
+# For opkg: OpenWRT 24.10+ may use /var/opkg-lists/ which isn't always a symlink to /tmp/.
+detect_feed_cache_dir() {
+    if [ "$PKG_MGR" = "apk" ]; then
+        echo "/tmp/modem-interface-apk-cache"
+        return
+    fi
+    # opkg: If /var/opkg-lists/ exists and has files, opkg is using it
+    if [ -d /var/opkg-lists ] && [ "$(ls /var/opkg-lists/ 2>/dev/null)" ]; then
+        echo "/var/opkg-lists"
+        return
+    fi
+    # If /tmp/opkg-lists/ exists and has files, use it
+    if [ -d /tmp/opkg-lists ] && [ "$(ls /tmp/opkg-lists/ 2>/dev/null)" ]; then
+        echo "/tmp/opkg-lists"
+        return
+    fi
+    # Default: /tmp/opkg-lists (will be created by refresh_feed)
+    echo "/tmp/opkg-lists"
+}
+
+FEED_CACHE_DIR=$(detect_feed_cache_dir)
+
+# Detect the OpenWrt subtarget architecture (e.g. aarch64_cortex-a53).
+# Priority order (first non-empty wins):
+#   1. /etc/apk/arch               - OpenWrt's source of truth
+#   2. DISTRIB_ARCH in /etc/openwrt_release
+#   3. apk --print-arch            - last resort; returns CPU family
+#      (e.g. "aarch64") not the full subtarget arch, so unreliable for
+#      feed URL construction.
+get_arch() {
+    # 1. /etc/apk/arch
+    if [ -f /etc/apk/arch ]; then
+        local arch
+        arch=$(cat /etc/apk/arch 2>/dev/null | tr -d ' \t\r\n')
+        if [ -n "$arch" ]; then
+            echo "$arch"
+            return
+        fi
+    fi
+
+    # 2. DISTRIB_ARCH from /etc/openwrt_release
+    if [ -f /etc/openwrt_release ]; then
+        local arch
+        arch=$(sed -n "s/^DISTRIB_ARCH=['\"]\?\([^'\"]*\)['\"]\?$/\1/p" /etc/openwrt_release 2>/dev/null | head -1 | tr -d ' \t\r\n')
+        if [ -n "$arch" ]; then
+            echo "$arch"
+            return
+        fi
+    fi
+
+    # 3. Last resort: apk --print-arch (returns CPU family, not full subtarget)
+    if command -v apk >/dev/null 2>&1; then
+        local arch
+        arch=$(apk --print-arch 2>/dev/null | tr -d ' \t\r\n')
+        if [ -n "$arch" ]; then
+            echo "$arch"
+            return
+        fi
+    fi
+
+    echo ""
+}
+
+log() {
+    local msg="$(date '+%Y-%m-%d %H:%M:%S') $1"
+    echo "$msg" >> "$LOGFILE"
+    logger -t modem-interface-update "$1"
+}
+
+# Trim log file if too large
+trim_log() {
+    if [ -f "$LOGFILE" ] && [ "$(wc -l < "$LOGFILE")" -gt "$MAX_LOG_LINES" ]; then
+        tail -n "$MAX_LOG_LINES" "$LOGFILE" > "$LOGFILE.tmp"
+        mv "$LOGFILE.tmp" "$LOGFILE"
+    fi
+}
+
+# Get the custom feed URL from package manager config
+# Matches on URL content (modem-interface or ctrl-modem) rather than feed name,
+# so it works regardless of what the user named their feed entry.
+get_feed_url() {
+    if [ "$PKG_MGR" = "apk" ]; then
+        # apk repositories: one URL per line, no prefix
+        local url=""
+        for conf in /etc/apk/repositories /etc/apk/repositories.d/*.list; do
+            [ -f "$conf" ] || continue
+            while read -r url; do
+                # Skip empty lines and comments
+                case "$url" in
+                    ""|\#*) continue ;;
+                esac
+                case "$url" in
+                    *modem-interface*|*ctrl-modem*)
+                        # APK auto-appends device arch to bare feed URLs.
+                        # Detect arch and append it so direct downloads work.
+                        local arch=$(get_arch)
+                        if [ -n "$arch" ]; then
+                            local base="${url%/}"
+                            # Only append if URL doesn't already end with the arch
+                            case "$base" in
+                                *"$arch") echo "$base"; return ;;
+                                *) echo "$base/$arch"; return ;;
+                            esac
+                        fi
+                        echo "$url"; return
+                        ;;
+                esac
+            done < "$conf"
+        done
+        echo ""
+        return
+    fi
+    # opkg path
+    local url=""
+    local line=""
+    for conf in /etc/opkg/customfeeds.conf /etc/opkg/distfeeds.conf; do
+        [ -f "$conf" ] || continue
+        while read -r line; do
+            url=$(echo "$line" | awk '{print $3}')
+            case "$url" in
+                *modem-interface*|*ctrl-modem*) echo "$url"; return ;;
+            esac
+        done < "$conf"
+    done
+    echo ""
+}
+
+# Download a file using the best available HTTP client.
+# OpenWRT's BusyBox wget often lacks HTTPS support, so prefer uclient-fetch
+# (OpenWRT's native HTTP client which always supports HTTPS).
+# TLS certificates are validated against the system CA bundle (the ca-bundle
+# package is a hard dependency); none of the tools below skip verification.
+# Args: $1=URL $2=output_file
+download() {
+    local url="$1" dest="$2"
+    local err_file="/tmp/modem-interface-dl-err.txt"
+
+    # Try uclient-fetch first (OpenWRT native, always has HTTPS)
+    if command -v uclient-fetch >/dev/null 2>&1; then
+        log "Downloading via uclient-fetch: $url"
+        if uclient-fetch -q -O "$dest" "$url" 2>"$err_file"; then
+            rm -f "$err_file"
+            return 0
+        fi
+        local dl_err=$(cat "$err_file" 2>/dev/null)
+        log "uclient-fetch failed: $dl_err"
+        rm -f "$err_file" "$dest"
+    fi
+
+    # Fall back to wget (may be GNU wget with SSL, or BusyBox without)
+    if command -v wget >/dev/null 2>&1; then
+        log "Downloading via wget: $url"
+        if wget -q -T 30 -O "$dest" "$url" 2>"$err_file"; then
+            rm -f "$err_file"
+            return 0
+        fi
+        local dl_err=$(cat "$err_file" 2>/dev/null)
+        log "wget failed: $dl_err"
+        rm -f "$err_file" "$dest"
+    fi
+
+    # Last resort: curl
+    if command -v curl >/dev/null 2>&1; then
+        log "Downloading via curl: $url"
+        if curl -sS -o "$dest" --connect-timeout 30 "$url" 2>"$err_file"; then
+            rm -f "$err_file"
+            return 0
+        fi
+        local dl_err=$(cat "$err_file" 2>/dev/null)
+        log "curl failed: $dl_err"
+        rm -f "$err_file" "$dest"
+    fi
+
+    log "ERROR: No working HTTP client could download $url"
+    return 1
+}
+
+# Detect OpenWRT architecture (e.g. aarch64_cortex-a53, mipsel_24kc)
+detect_arch() {
+    if [ "$PKG_MGR" = "apk" ]; then
+        local arch=$(get_arch)
+        if [ -n "$arch" ]; then
+            echo "$arch"
+            return
+        fi
+    fi
+    # Prefer opkg print-architecture: pick the line with the highest priority
+    if command -v opkg >/dev/null 2>&1; then
+        local arch=$(opkg print-architecture 2>/dev/null \
+            | sort -k3 -n -r | head -1 | awk '{print $2}')
+        if [ -n "$arch" ] && [ "$arch" != "all" ] && [ "$arch" != "noarch" ]; then
+            echo "$arch"
+            return
+        fi
+    fi
+    # Fallback: parse /etc/openwrt_release
+    if [ -f /etc/openwrt_release ]; then
+        local arch=$(. /etc/openwrt_release 2>/dev/null && echo "$DISTRIB_ARCH")
+        if [ -n "$arch" ]; then
+            echo "$arch"
+            return
+        fi
+    fi
+    echo ""
+}
+
+# Try downloading feed index from a feed URL.
+# For apk: downloads APKINDEX.tar.gz and extracts APKINDEX
+# For opkg: downloads Packages.gz (or Packages) and writes to FEED_CACHE_DIR
+# Returns 0 on success.
+# Args: $1=feed_url
+try_download_feed() {
+    local feed_url="$1"
+    local cache_bust="t=$(date +%s)"
+
+    # apk path is handled by refresh_feed directly via native `apk update`.
+    # try_download_feed is only invoked from the opkg branch of refresh_feed.
+
+    # opkg path
+    local tmp_pkg="/tmp/modem-interface-Packages.gz"
+    rm -f "$tmp_pkg"
+
+    if download "$feed_url/Packages.gz?$cache_bust" "$tmp_pkg"; then
+        if gunzip -c "$tmp_pkg" > "$FEED_CACHE_DIR/$FEED_NAME" 2>/dev/null; then
+            rm -f "$tmp_pkg"
+            if grep -q "^Package:" "$FEED_CACHE_DIR/$FEED_NAME" 2>/dev/null; then
+                local feed_ver=$(grep "^Version:" "$FEED_CACHE_DIR/$FEED_NAME" | head -1 | cut -d' ' -f2)
+                log "Feed refreshed successfully (feed version: $feed_ver)"
+                return 0
+            else
+                log "WARNING: Downloaded feed does not contain valid package data"
+                rm -f "$FEED_CACHE_DIR/$FEED_NAME"
+            fi
+        else
+            log "WARNING: Failed to decompress Packages.gz"
+            rm -f "$tmp_pkg"
+        fi
+    fi
+
+    # Fall back to uncompressed Packages
+    if download "$feed_url/Packages?$cache_bust" "$FEED_CACHE_DIR/$FEED_NAME"; then
+        if grep -q "^Package:" "$FEED_CACHE_DIR/$FEED_NAME" 2>/dev/null; then
+            local feed_ver=$(grep "^Version:" "$FEED_CACHE_DIR/$FEED_NAME" | head -1 | cut -d' ' -f2)
+            log "Feed refreshed successfully, uncompressed (feed version: $feed_ver)"
+            return 0
+        else
+            log "WARNING: Downloaded uncompressed feed is not valid package data"
+            rm -f "$FEED_CACHE_DIR/$FEED_NAME"
+        fi
+    fi
+
+    return 1
+}
+
+# Update the feed URL in package manager config to include the architecture subdirectory.
+# Args: $1=old_url $2=new_url
+update_feed_config() {
+    local old_url="$1" new_url="$2"
+
+    if [ "$PKG_MGR" = "apk" ]; then
+        # Update apk repositories files
+        local conf_file=""
+        for conf in /etc/apk/repositories /etc/apk/repositories.d/*.list; do
+            [ -f "$conf" ] || continue
+            if grep -q "$old_url" "$conf" 2>/dev/null; then
+                conf_file="$conf"
+                break
+            fi
+        done
+        if [ -n "$conf_file" ]; then
+            sed -i "s|$old_url|$new_url|g" "$conf_file"
+            log "Updated feed URL in $conf_file: $old_url -> $new_url"
+        fi
+        return
+    fi
+
+    # opkg path
+    local conf_file=""
+    if [ -f /etc/opkg/customfeeds.conf ] && grep -q "$old_url" /etc/opkg/customfeeds.conf 2>/dev/null; then
+        conf_file="/etc/opkg/customfeeds.conf"
+    elif [ -f /etc/opkg/distfeeds.conf ] && grep -q "$old_url" /etc/opkg/distfeeds.conf 2>/dev/null; then
+        conf_file="/etc/opkg/distfeeds.conf"
+    fi
+    if [ -n "$conf_file" ]; then
+        sed -i "s|$old_url|$new_url|g" "$conf_file"
+        log "Updated feed URL in $conf_file: $old_url -> $new_url"
+    fi
+}
+
+# Refresh only our custom feed (avoids full opkg update which can hang
+# on unreachable upstream OpenWRT feeds).
+#
+# For apk: delegates to native `apk update`. APK v3 (apk-tools 3.x on
+# OpenWrt 24.10+) made APKINDEX.tar.gz an ADB binary format, so the custom
+# tar-based parser no longer works. `apk update` refreshes apk's own cache
+# from /etc/apk/repositories{,.d/*.list} and understands ADB natively.
+#
+# For opkg: downloads Packages.gz directly into FEED_CACHE_DIR (unchanged).
+refresh_feed() {
+    if [ "$PKG_MGR" = "apk" ]; then
+        log "Refreshing apk cache via native 'apk update'"
+        # Capture combined stdout+stderr for the log. Non-zero exit is not
+        # fatal — a partial cache may still contain our package from an
+        # earlier successful refresh.
+        local update_output
+        update_output=$(apk update 2>&1)
+        local update_rc=$?
+        if [ -n "$update_output" ]; then
+            echo "$update_output" | while IFS= read -r line; do log "apk update: $line"; done
+        fi
+        if [ $update_rc -ne 0 ]; then
+            log "WARNING: 'apk update' exited with code $update_rc, continuing with existing cache"
+        fi
+        # Always return success — `get_available_version` will surface the
+        # real error (package not found) if the cache is empty.
+        return 0
+    fi
+
+    # opkg path
+    local feed_url=$(get_feed_url)
+    if [ -z "$feed_url" ]; then
+        log "ERROR: Cannot find modem-interface/ctrl-modem feed URL in $PKG_MGR config"
+        return 1
+    fi
+
+    mkdir -p "$FEED_CACHE_DIR"
+    log "Refreshing feed from $feed_url"
+
+    # Try the configured URL first
+    if try_download_feed "$feed_url"; then
+        return 0
+    fi
+
+    # Feed download failed — the URL may be the old flat layout (pre-multi-arch).
+    # Try appending the detected architecture subdirectory.
+    log "Feed download failed at $feed_url, attempting architecture auto-detection..."
+    local arch=$(detect_arch)
+    if [ -z "$arch" ]; then
+        log "ERROR: Could not detect router architecture for feed URL fallback"
+        log "ERROR: Failed to download feed from $feed_url"
+        return 1
+    fi
+
+    # Strip trailing slash from feed_url before appending arch
+    local base_url="${feed_url%/}"
+    local arch_url="$base_url/$arch"
+    log "Trying arch-specific feed URL: $arch_url"
+
+    if try_download_feed "$arch_url"; then
+        log "Arch-specific feed works, updating config for future runs"
+        update_feed_config "$feed_url" "$arch_url"
+        return 0
+    fi
+
+    log "ERROR: Failed to download feed from both $feed_url and $arch_url"
+    return 1
+}
+
+# Acquire lock (prevent concurrent runs from cron + UI)
+acquire_lock() {
+    if [ -f "$LOCKFILE" ]; then
+        local pid=$(cat "$LOCKFILE" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            log "ERROR: Another update process is running (PID $pid)"
+            exit 2
+        fi
+        rm -f "$LOCKFILE"
+    fi
+    echo $$ > "$LOCKFILE"
+}
+
+release_lock() {
+    rm -f "$LOCKFILE"
+}
+
+# Get installed version
+get_installed_version() {
+    if [ "$PKG_MGR" = "apk" ]; then
+        # APK v3 (apk-tools 3.x) changed `apk info -v` output format to show
+        # package description lines rather than `<pkg>-<ver>-rN`, so the old
+        # grep-based parse broke silently. Use `apk list --installed` instead:
+        # same stable format as `--available`, e.g.
+        #   modem-interface-1.0.148-r1 aarch64_cortex-a53 {modem-interface} (...) [installed]
+        local line pkg_ver
+        line=$(apk list --installed "$PKG_NAME" 2>/dev/null | awk 'NF { print; exit }')
+        [ -z "$line" ] && return
+        pkg_ver="${line%% *}"
+        case "$pkg_ver" in
+            "${PKG_NAME}-"*)
+                local ver="${pkg_ver#${PKG_NAME}-}"
+                # Remove -rN revision suffix (e.g. 1.0.148-r1 -> 1.0.148)
+                echo "$ver" | sed 's/-r[0-9]*$//'
+                ;;
+        esac
+        return
+    fi
+    # opkg: opkg status only shows installed packages,
+    # unlike opkg info which also shows available feed versions
+    opkg status "$PKG_NAME" 2>/dev/null | grep "^Version:" | cut -d' ' -f2
+}
+
+# Get available version from feed cache
+get_available_version() {
+    if [ "$PKG_MGR" = "apk" ]; then
+        get_apkindex_version "$PKG_NAME"
+        return
+    fi
+    get_feed_version "$PKG_NAME"
+}
+
+# Get the available version for a package via native `apk list --available`.
+#
+# APK v3 APKINDEX is an ADB binary format (magic bytes `ADBd`), not a gzipped
+# tar, so the old awk-over-APKINDEX approach breaks on OpenWrt 24.10+. Using
+# `apk list --available` delegates parsing to apk itself.
+#
+# Output format is:
+#   modem-interface-1.0.148-r1 aarch64_cortex-a53 {modem-interface} (...) [installed]
+# We take the first non-empty line, first whitespace-separated token, and
+# strip the `<pkg>-` prefix.
+#
+# Args: $1=package-name (default: modem-interface)
+get_apkindex_version() {
+    local pkg="${1:-modem-interface}"
+    local line pkg_ver
+    line=$(apk list --available "$pkg" 2>/dev/null | awk 'NF { print; exit }')
+    [ -z "$line" ] && return
+    # First whitespace-separated token: `<pkg>-<version>-rN`
+    pkg_ver="${line%% *}"
+    # Strip leading `<pkg>-`
+    case "$pkg_ver" in
+        "${pkg}-"*) printf '%s\n' "${pkg_ver#${pkg}-}" ;;
+        *) return ;;
+    esac
+}
+
+# Get the .apk filename from APKINDEX for a given package name
+# In apk, the filename is constructed as: <package>-<version>.apk
+# Args: $1=package-name (default: modem-interface)
+get_apk_filename() {
+    local pkg="${1:-modem-interface}"
+    local ver=$(get_apkindex_version "$pkg")
+    if [ -n "$ver" ]; then
+        echo "${pkg}-${ver}.apk"
+    fi
+}
+
+# Check if update is available (refreshes feed first)
+check_update() {
+    log "Checking for updates..."
+
+    # Refresh our custom feed — failure is fatal for check since without
+    # fresh feed data, parsing returns stale or empty results
+    if ! refresh_feed; then
+        log "ERROR: Feed refresh failed, cannot determine available version"
+        return 2
+    fi
+
+    local installed=$(get_installed_version)
+    local available=$(get_available_version)
+
+    log "Versions: installed=$installed available=$available"
+
+    if [ -z "$installed" ]; then
+        log "ERROR: Package $PKG_NAME not installed"
+        return 2
+    fi
+
+    if [ -z "$available" ]; then
+        log "ERROR: Cannot determine available version (feed unreachable?)"
+        return 2
+    fi
+
+    if [ "$installed" = "$available" ]; then
+        log "Up to date: $installed"
+        return 1
+    fi
+
+    log "Update available: $installed -> $available"
+    return 0
+}
+
+# Get the .ipk filename from the feed cache file for a given package name
+# Args: $1=package-name (default: modem-interface)
+get_ipk_filename() {
+    local pkg="${1:-modem-interface}"
+    if [ -f "$FEED_CACHE_DIR/$FEED_NAME" ]; then
+        awk -v pkg="$pkg" '/^Package: /{found=($2==pkg); next} found && /^Filename: /{print $2; exit} found && /^$/{exit}' \
+            "$FEED_CACHE_DIR/$FEED_NAME" 2>/dev/null
+    fi
+}
+
+# Get the available version from the feed cache for a given package name
+# Args: $1=package-name (default: modem-interface)
+get_feed_version() {
+    local pkg="${1:-modem-interface}"
+    if [ -f "$FEED_CACHE_DIR/$FEED_NAME" ]; then
+        awk -v pkg="$pkg" '/^Package: /{found=($2==pkg); next} found && /^Version: /{print $2; exit} found && /^$/{exit}' \
+            "$FEED_CACHE_DIR/$FEED_NAME" 2>/dev/null
+    fi
+}
+
+# Upgrade a companion package if it is installed and a newer version is in the feed
+# Args: $1=package-name
+upgrade_companion() {
+    local pkg="$1"
+    local feed_url=$(get_feed_url)
+
+    if [ "$PKG_MGR" = "apk" ]; then
+        # Check if the companion is installed
+        local comp_installed=$(apk info -v "$pkg" 2>/dev/null | grep "^${pkg}-" | head -1)
+        if [ -z "$comp_installed" ]; then
+            return 0  # not installed, nothing to do
+        fi
+        local comp_ver="${comp_installed#${pkg}-}"
+        comp_ver=$(echo "$comp_ver" | sed 's/-r[0-9]*$//')
+
+        local comp_available=$(get_apkindex_version "$pkg")
+        if [ -z "$comp_available" ]; then
+            log "  $pkg: installed ($comp_ver) but not found in feed, skipping"
+            return 0
+        fi
+
+        if [ "$comp_ver" = "$comp_available" ]; then
+            log "  $pkg: already up to date ($comp_ver)"
+            return 0
+        fi
+
+        local comp_filename=$(get_apk_filename "$pkg")
+        if [ -z "$comp_filename" ] || [ -z "$feed_url" ]; then
+            log "  $pkg: cannot determine download URL, skipping"
+            return 0
+        fi
+
+        local cache_bust="t=$(date +%s)"
+        local comp_url="$feed_url/$comp_filename?$cache_bust"
+        local comp_path="/tmp/$comp_filename"
+
+        log "  $pkg: upgrading $comp_ver -> $comp_available"
+        if download "$comp_url" "$comp_path"; then
+            apk add --allow-untrusted "$comp_path" 2>&1 | while read -r line; do log "apk: $line"; done || true
+            rm -f "$comp_path"
+            local comp_new=$(apk info -v "$pkg" 2>/dev/null | grep "^${pkg}-" | head -1)
+            if [ -n "$comp_new" ]; then
+                local comp_new_ver="${comp_new#${pkg}-}"
+                comp_new_ver=$(echo "$comp_new_ver" | sed 's/-r[0-9]*$//')
+                if [ "$comp_new_ver" != "$comp_ver" ]; then
+                    log "  $pkg: upgraded to $comp_new_ver"
+                else
+                    log "  $pkg: upgrade may have failed (version still $comp_ver)"
+                fi
+            fi
+        else
+            log "  $pkg: download failed, skipping"
+        fi
+        return
+    fi
+
+    # opkg path
+    # Check if the companion is installed
+    local comp_installed=$(opkg status "$pkg" 2>/dev/null | grep "^Version:" | cut -d' ' -f2)
+    if [ -z "$comp_installed" ]; then
+        return 0  # not installed, nothing to do
+    fi
+
+    local comp_available=$(get_feed_version "$pkg")
+    if [ -z "$comp_available" ]; then
+        log "  $pkg: installed ($comp_installed) but not found in feed, skipping"
+        return 0
+    fi
+
+    if [ "$comp_installed" = "$comp_available" ]; then
+        log "  $pkg: already up to date ($comp_installed)"
+        return 0
+    fi
+
+    local comp_filename=$(get_ipk_filename "$pkg")
+    if [ -z "$comp_filename" ] || [ -z "$feed_url" ]; then
+        log "  $pkg: cannot determine download URL, skipping"
+        return 0
+    fi
+
+    local cache_bust="t=$(date +%s)"
+    local comp_url="$feed_url/$comp_filename?$cache_bust"
+    local comp_path="/tmp/$comp_filename"
+
+    log "  $pkg: upgrading $comp_installed -> $comp_available"
+    if download "$comp_url" "$comp_path"; then
+        opkg install "$comp_path" 2>&1 | while read -r line; do log "opkg: $line"; done || true
+        rm -f "$comp_path"
+        local comp_new=$(opkg status "$pkg" 2>/dev/null | grep "^Version:" | cut -d' ' -f2)
+        if [ "$comp_new" != "$comp_installed" ]; then
+            log "  $pkg: upgraded to $comp_new"
+        else
+            log "  $pkg: upgrade may have failed (version still $comp_installed)"
+        fi
+    else
+        log "  $pkg: download failed, skipping"
+    fi
+}
+
+# Apply the update by downloading the package directly and installing it.
+# This bypasses "opkg upgrade" / "apk upgrade" which can silently do nothing
+# on some OpenWRT configurations even when the feed has a newer version available.
+apply_update() {
+    local installed=$(get_installed_version)
+    log "Applying update from $installed..."
+
+    # Write status file (persists across service restart)
+    cat > "$STATUS_FILE" <<EOF
+{"status":"updating","previous_version":"$installed","timestamp":"$(date -Iseconds 2>/dev/null || date)"}
+EOF
+
+    local feed_url=$(get_feed_url)
+
+    if [ "$PKG_MGR" = "apk" ]; then
+        local apk_filename=$(get_apk_filename)
+
+        if [ -n "$feed_url" ] && [ -n "$apk_filename" ]; then
+            local cache_bust="t=$(date +%s)"
+            local apk_url="$feed_url/$apk_filename?$cache_bust"
+            local apk_path="/tmp/$apk_filename"
+
+            log "Downloading $apk_filename from feed..."
+            if download "$apk_url" "$apk_path"; then
+                log "Installing $apk_path via apk add..."
+                local install_rc=0
+                apk add --allow-untrusted "$apk_path" 2>&1 | while read -r line; do log "apk: $line"; done || install_rc=$?
+                rm -f "$apk_path"
+
+                local new_version=$(get_installed_version)
+                if [ "$new_version" != "$installed" ]; then
+                    log "Core update successful: $installed -> $new_version"
+                    log "Checking companion packages..."
+                    upgrade_companion "luci-app-ctrl-modem"
+                    cat > "$STATUS_FILE" <<EOF
+{"status":"completed","previous_version":"$installed","new_version":"$new_version","timestamp":"$(date -Iseconds 2>/dev/null || date)"}
+EOF
+                    return 0
+                fi
+                log "apk add exited with code $install_rc but version unchanged"
+            else
+                log "ERROR: Failed to download $apk_url"
+            fi
+        else
+            log "WARNING: Cannot determine feed URL ($feed_url) or filename ($apk_filename), trying apk upgrade"
+        fi
+
+        # Fallback: try apk upgrade
+        log "Trying apk upgrade as fallback..."
+        apk upgrade --allow-untrusted "$PKG_NAME" 2>&1 | while read -r line; do log "apk: $line"; done || true
+
+        local new_version=$(get_installed_version)
+        if [ "$new_version" != "$installed" ]; then
+            log "Core update successful via apk upgrade: $installed -> $new_version"
+            log "Checking companion packages..."
+            upgrade_companion "luci-app-ctrl-modem"
+            cat > "$STATUS_FILE" <<EOF
+{"status":"completed","previous_version":"$installed","new_version":"$new_version","timestamp":"$(date -Iseconds 2>/dev/null || date)"}
+EOF
+            return 0
+        fi
+
+        log "ERROR: Update failed (version still $installed)"
+        cat > "$STATUS_FILE" <<EOF
+{"status":"failed","version":"$installed","timestamp":"$(date -Iseconds 2>/dev/null || date)"}
+EOF
+        return 2
+    fi
+
+    # opkg path
+    local ipk_filename=$(get_ipk_filename)
+
+    if [ -n "$feed_url" ] && [ -n "$ipk_filename" ]; then
+        # Direct download and install (bypasses opkg upgrade issues)
+        local cache_bust="t=$(date +%s)"
+        local ipk_url="$feed_url/$ipk_filename?$cache_bust"
+        local ipk_path="/tmp/$ipk_filename"
+
+        log "Downloading $ipk_filename from feed..."
+        if download "$ipk_url" "$ipk_path"; then
+            log "Installing $ipk_path via opkg install..."
+            local install_rc=0
+            opkg install "$ipk_path" 2>&1 | while read -r line; do log "opkg: $line"; done || install_rc=$?
+            rm -f "$ipk_path"
+
+            local new_version=$(get_installed_version)
+            if [ "$new_version" != "$installed" ]; then
+                log "Core update successful: $installed -> $new_version"
+                # Upgrade companion packages if installed
+                log "Checking companion packages..."
+                upgrade_companion "luci-app-ctrl-modem"
+                cat > "$STATUS_FILE" <<EOF
+{"status":"completed","previous_version":"$installed","new_version":"$new_version","timestamp":"$(date -Iseconds 2>/dev/null || date)"}
+EOF
+                return 0
+            fi
+            log "opkg install exited with code $install_rc but version unchanged"
+        else
+            log "ERROR: Failed to download $ipk_url"
+        fi
+    else
+        log "WARNING: Cannot determine feed URL ($feed_url) or filename ($ipk_filename), trying opkg upgrade"
+    fi
+
+    # Fallback: try opkg upgrade (may not work but worth a shot)
+    log "Trying opkg upgrade as fallback..."
+    opkg upgrade "$PKG_NAME" 2>&1 | while read -r line; do log "opkg: $line"; done || true
+
+    local new_version=$(get_installed_version)
+    if [ "$new_version" != "$installed" ]; then
+        log "Core update successful via opkg upgrade: $installed -> $new_version"
+        # Upgrade companion packages if installed
+        log "Checking companion packages..."
+        upgrade_companion "luci-app-ctrl-modem"
+        cat > "$STATUS_FILE" <<EOF
+{"status":"completed","previous_version":"$installed","new_version":"$new_version","timestamp":"$(date -Iseconds 2>/dev/null || date)"}
+EOF
+        return 0
+    fi
+
+    log "ERROR: Update failed (version still $installed)"
+    cat > "$STATUS_FILE" <<EOF
+{"status":"failed","version":"$installed","timestamp":"$(date -Iseconds 2>/dev/null || date)"}
+EOF
+    return 2
+}
+
+# --- Commands ---
+
+cmd_check() {
+    acquire_lock
+    trap release_lock EXIT
+    check_update
+}
+
+cmd_apply() {
+    # Check UCI config for auto-update (only when called without explicit "apply" from API)
+    # The API always passes "apply" explicitly, cron also calls "apply"
+    # but we check the UCI setting so users can disable via config
+    local auto_update=$(uci get modem-interface.update.auto_update 2>/dev/null)
+    if [ "$auto_update" = "0" ]; then
+        log "Auto-update disabled in UCI config"
+        return 0
+    fi
+
+    acquire_lock
+    trap release_lock EXIT
+
+    # Check first (capture rc without triggering set -e)
+    local rc=0
+    check_update || rc=$?
+    if [ $rc -eq 0 ]; then
+        apply_update
+    elif [ $rc -eq 1 ]; then
+        log "No update to apply"
+        return 1
+    else
+        return $rc
+    fi
+}
+
+cmd_version() {
+    local installed=$(get_installed_version)
+    local available=$(get_available_version)
+    printf '{"installed":"%s","available":"%s","pkg_mgr":"%s"}\n' \
+        "${installed:-unknown}" "${available:-unknown}" "$PKG_MGR"
+}
+
+# --- Main ---
+
+trim_log
+log "Package manager: $PKG_MGR"
+
+case "${1:-check}" in
+    check)   cmd_check ;;
+    apply)   cmd_apply ;;
+    version) cmd_version ;;
+    *)
+        echo "Usage: $0 {check|apply|version}" >&2
+        exit 2
+        ;;
+esac

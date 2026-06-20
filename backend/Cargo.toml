@@ -1,0 +1,137 @@
+[package]
+name = "modem-interface"
+version = "1.4.0"
+edition = "2021"
+authors = ["OpenWRT Modem Interface Team"]
+description = "Web interface for cellular modem management on OpenWRT"
+license = "MIT"
+
+[dependencies]
+# Web framework
+axum = { version = "0.7", features = ["ws", "macros"] }
+axum-extra = { version = "0.9", features = ["typed-header", "cookie"] }
+tower = { version = "0.4", features = ["util", "timeout"] }
+tower-http = { version = "0.5", features = ["fs", "trace", "compression-gzip"] }
+
+# Async runtime — explicit minimal feature set (was ["full"]). spawn_blocking
+# needs rt-multi-thread. Trimmed io-std/test-util and other unused convenience
+# pulls; a missing feature is a compile error, not a silent runtime bug.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "process", "sync", "time", "signal"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async trait support
+async-trait = "0.1"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+# Configuration
+toml = "0.8"
+directories = "5"
+
+# Time handling — default-features = false drops oldtime/wasmbind/js-sys (unused
+# on the router). "clock" keeps Utc::now(); "serde" for (de)serialization.
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+
+# UUID generation (for APN profile IDs)
+uuid = { version = "1", features = ["v4"] }
+
+# Async utilities
+futures-util = "0.3"
+
+# Lazy initialization
+once_cell = "1"
+
+# AtomicU64 polyfill — mips32 (mipsel_24kc) has max_atomic_width=32, so
+# std::sync::atomic::AtomicU64 doesn't exist there. On 64-bit targets this
+# re-exports the core atomics (zero cost). Item #31 Phase 1.
+portable-atomic = "1"
+
+# Embedded assets (for production single-binary)
+rust-embed = { version = "8", features = ["compression"] }
+mime_guess = "2"
+
+# Security
+argon2 = "0.5"
+rand = "0.8"
+pwhash = "1"
+
+# License verification
+ed25519-dalek = { version = "2", features = ["pem"] }
+sha2 = "0.10"
+data-encoding = "2"
+base64 = "0.22"
+
+# Regex for AT command parsing
+regex = "1"
+
+# Device detection
+glob = "0.3"
+
+# TLS support (pure Rust, no system OpenSSL dependency)
+# default-features = false + tls-rustls-no-provider keeps aws-lc-sys out of the
+# build graph (rustls provider is pinned to ring below). See scripts/check-no-aws-lc.sh.
+axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
+# Remote access tunnel (outbound WSS + local HTTP proxy)
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# Native TLS health probe for `env set` (cli/env_cmd.rs). Already in the build
+# graph via tokio-tungstenite's rustls-tls-webpki-roots — naming it directly
+# adds no new crates. default-features = false keeps aws-lc-sys out (ring
+# provider is passed explicitly). See scripts/check-no-aws-lc.sh.
+tokio-rustls = { version = "0.26", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
+
+# Optional: Hardware layer dependencies (feature-gated)
+[features]
+default = ["mock-hardware"]
+mock-hardware = []
+real-hardware = ["dep:serialport", "tunnel"]
+tls = ["dep:axum-server"]
+embedded-frontend = []
+tunnel = ["dep:reqwest"]
+
+[dependencies.serialport]
+version = "4"
+optional = true
+# default-features = false drops libudev; port enumeration is unused — ports are
+# opened by sysfs-derived path.
+default-features = false
+
+[dev-dependencies]
+tempfile = "3"
+# PEM parsing for the embedded self-signed cert used by the env_cmd health-probe
+# TLS tests. Already in the build graph (rustls's pki-types); pem support is
+# built-in at this version (no new transitive deps, no aws-lc-sys).
+rustls-pki-types = "1.14"
+
+[profile.release]
+opt-level = "z"
+lto = "thin"
+codegen-units = 2
+panic = "abort"
+strip = true
+
+# Mipsel-only size pass (Item #31 Phase 2). Fat LTO + a single codegen unit
+# squeeze the mipsel_24kc binary toward the ~8.7 MB overlay budget. Kept
+# separate from [profile.release] so the shipping aarch64/armv7 CI builds stay
+# on thin LTO / cgu=2 (CI box RAM + build-time envelope). Built only by
+# scripts/build-backend-mipsel.sh.
+[profile.release-mipsel]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 0
+debug = true

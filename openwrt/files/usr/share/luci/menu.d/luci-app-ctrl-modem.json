@@ -1,0 +1,15 @@
+{
+	"admin/network/ctrl_modem": {
+		"title": "CTRL-Modem",
+		"order": 90,
+		"action": {
+			"type": "view",
+			"path": "network/ctrl-modem"
+		},
+		"depends": {
+			"fs": {
+				"/usr/bin/modem-interface": "file"
+			}
+		}
+	}
+}

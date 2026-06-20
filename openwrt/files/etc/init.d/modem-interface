@@ -1,0 +1,97 @@
+#!/bin/sh /etc/rc.common
+
+# Modem Interface Service - Procd-based init script
+# Manages the modem-interface web application
+
+START=99
+STOP=10
+
+USE_PROCD=1
+PROG=/usr/bin/modem-interface
+
+start_service() {
+	# Wait for modem device to be ready (USB serial, QMI control, or PCIe/MHI)
+	local retries=15
+	local found=0
+	while [ $retries -gt 0 ]; do
+		if [ -e /dev/cdc-wdm0 ] || ls /dev/ttyUSB* >/dev/null 2>&1 || ls /dev/mhi_* >/dev/null 2>&1; then
+			found=1
+			break
+		fi
+		sleep 1
+		retries=$((retries - 1))
+	done
+
+	if [ $found -eq 0 ]; then
+		logger -t modem-interface "ERROR: No modem device found after 15 seconds, service will not start"
+		return 1
+	fi
+
+	logger -t modem-interface "Starting modem-interface service, modem device ready"
+
+	# Auto-generate self-signed TLS certificate if missing
+	local cert_path="/etc/modem-interface/tls/cert.pem"
+	local key_path="/etc/modem-interface/tls/key.pem"
+	if [ ! -f "$cert_path" ]; then
+		if command -v openssl >/dev/null 2>&1; then
+			logger -t modem-interface "Generating self-signed TLS certificate..."
+			mkdir -p "$(dirname "$cert_path")"
+			openssl req -x509 \
+				-newkey rsa:2048 \
+				-days 3650 \
+				-nodes \
+				-keyout "$key_path" \
+				-out "$cert_path" \
+				-subj "/CN=modem-interface" \
+				2>/dev/null
+			if [ $? -eq 0 ]; then
+				chmod 600 "$key_path"
+				chmod 644 "$cert_path"
+				logger -t modem-interface "TLS certificate generated at $cert_path"
+			else
+				logger -t modem-interface "WARNING: Failed to generate TLS certificate, running HTTP-only"
+			fi
+		else
+			logger -t modem-interface "WARNING: openssl not found, cannot generate TLS certificate"
+		fi
+	fi
+
+	# Enable L4 (5-tuple) hashing for multipath routing.
+	# Ensures load-balanced traffic distributes by connection, not just by destination IP.
+	# Idempotent — safe even when load balancing is not active.
+	sysctl -w net.ipv4.fib_multipath_hash_policy=1 >/dev/null 2>&1 || true
+
+	procd_open_instance
+
+	# Main command
+	procd_set_param command $PROG
+
+	# Environment variables (single call — some procd builds overwrite on repeated calls)
+	procd_set_param env \
+		STATIC_FILES_PATH=/www/modem-interface \
+		LISTEN_ADDR=0.0.0.0:8080 \
+		RUST_LOG=info
+
+	# Respawn parameters: threshold timeout retry
+	# If process dies 5 times within 60 seconds, stop trying for 5 seconds
+	procd_set_param respawn 60 5 5
+
+	# Log stdout and stderr
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+
+	# Limits and permissions - ensure root access
+	procd_set_param user root
+	procd_set_param group root
+
+	procd_close_instance
+}
+
+reload_service() {
+	stop
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger "modem-interface"
+}

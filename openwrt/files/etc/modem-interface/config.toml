@@ -1,0 +1,79 @@
+# Modem Interface Configuration
+# This file is preserved across package upgrades
+
+[server]
+# Address and port to listen on
+listen_addr = "0.0.0.0:8080"
+
+# Path to static frontend files
+static_files_path = "/www/modem-interface"
+
+[modem]
+# Signal polling interval in seconds
+signal_poll_interval = 2
+
+# Default APN for mobile connections
+default_apn = "broadband"
+
+# Auto-connect on startup
+auto_connect = false
+
+[logging]
+# Log level: trace, debug, info, warn, error
+level = "info"
+
+# Log to syslog
+use_syslog = true
+
+[security]
+# Enable AT command whitelist
+enable_at_whitelist = true
+
+# Require confirmation for state-changing commands
+require_confirmation = true
+
+[auth]
+# Require authentication to access the web interface
+enabled = true
+# Session expiry in hours
+session_expiry_hours = 24
+# Path to user accounts database (preserved across upgrades)
+users_file = "/etc/modem-interface/users.json"
+# password_hash is populated on first-run setup via the web UI (legacy, migrated to users_file)
+
+[rate_limit]
+# Enable per-IP rate limiting
+enabled = true
+# Login: max attempts per IP within window
+login_max_attempts = 5
+login_window_secs = 900
+# Setup: max attempts per IP within window
+setup_max_attempts = 3
+setup_window_secs = 3600
+# General API: max requests per IP within window
+general_max_requests = 100
+general_window_secs = 60
+
+[tls]
+# Enable HTTPS (self-signed cert auto-generated on first boot)
+enabled = true
+# Certificate and key paths
+cert_path = "/etc/modem-interface/tls/cert.pem"
+key_path = "/etc/modem-interface/tls/key.pem"
+# HTTPS port (HTTP continues on listen_addr port for redirect)
+https_port = 8443
+# Redirect HTTP requests to HTTPS
+redirect_http = true
+
+[portal]
+# Base URL for all portal HTTPS calls (heartbeat, telemetry poll-config,
+# license activation). Switching this URL redirects every portal call in
+# one step. Use `modem-interface env set {production|staging}` instead of
+# editing by hand — the CLI also rewrites /etc/apk/repositories.d/ctrl-modem.list
+# atomically and verifies the service comes back healthy.
+base_url = "https://portal.ctrl-modem.com"
+
+# Tunnel WSS endpoint. If omitted, derived from base_url (scheme swapped
+# to wss://, path /api/v1/tunnel). Staging uses a separate hostname, so
+# this is made explicit there.
+tunnel_url = "wss://portal.ctrl-modem.com/api/v1/tunnel"

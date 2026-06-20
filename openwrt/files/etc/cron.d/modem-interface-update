@@ -1,0 +1,2 @@
+# Check for modem-interface updates weekly on Sunday at 3am (with random 0-5min jitter)
+0 3 * * 0 root sleep $(( RANDOM % 300 )) && /usr/bin/modem-interface-update apply >> /var/log/modem-interface-update.log 2>&1

@@ -1,0 +1,5 @@
+/etc/config/modem-interface
+/etc/modem-interface/config.toml
+/etc/modem-interface/users.json
+/etc/modem-interface/tls/cert.pem
+/etc/modem-interface/tls/key.pem

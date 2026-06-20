@@ -1,0 +1,13 @@
+Package: modem-interface
+Version: 1.0.7-1
+Depends: libc, kmod-usb-serial, kmod-usb-serial-option, kmod-usb-serial-wwan, openssl-util, ca-bundle
+Recommends: luci-app-ctrl-modem, modem-interface-nginx
+Source: ctrl-modem
+Section: net
+Architecture: aarch64_cortex-a53
+Installed-Size: 0
+Maintainer: agccc <agccc@netsolution.shop>
+Description: CTRL-Modem — cellular modem management interface
+ A standalone web interface for managing cellular modems on OpenWRT routers.
+ Part of the CTRL-Modem suite. Supports 4G/5G modems with real-time signal
+ monitoring, connection management, and multi-WAN failover.

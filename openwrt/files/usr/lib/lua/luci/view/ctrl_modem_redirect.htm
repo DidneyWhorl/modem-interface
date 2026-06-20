@@ -1,0 +1,16 @@
+<%+header%>
+
+<script type="text/javascript">
+//<![CDATA[
+(function() {
+    var proto = (window.location.protocol === 'https:') ? 'https' : 'http';
+    var port = (proto === 'https') ? '8443' : '8082';
+    var target = proto + '://' + window.location.hostname + ':' + port + '/ctrl-modem/home';
+    window.location.href = target;
+})();
+//]]>
+</script>
+
+<p>Redirecting to CTRL-Modem...</p>
+
+<%+footer%>

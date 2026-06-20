@@ -1,0 +1,71 @@
+# Rust
+backend/target/
+# Cargo.lock is committed for reproducible builds (this is an application, not a library)
+
+# Node.js
+frontend/node_modules/
+frontend/dist/
+
+# Build artifacts
+build-pkg/
+*.tar.gz
+modem-interface-aarch64
+modem-interface-*.tar.gz
+
+# IDE / AI tooling
+.vscode/
+.idea/
+.claude/
+.superpowers/
+CLAUDE.md
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# CI/CD
+.woodpecker/
+
+# Archive (old snapshots, not tracked)
+archive/
+
+# Built packages (root level)
+*.ipk
+ci-build/
+opkg-lede-src/
+
+# Modem vendor documentation (large PDFs, kept locally for reference)
+docs/Modem_documentation/
+
+# Credentials / secrets (NEVER commit these)
+cookies.txt
+*.pem
+*.key
+*.sec
+
+# Windows artifacts
+nul

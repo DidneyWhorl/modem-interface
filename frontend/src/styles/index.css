@@ -1,0 +1,578 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ========================================
+   THEME: CSS Custom Property Definitions
+   ======================================== */
+
+/* Local Fallen theme font */
+@font-face {
+  font-family: 'Share Tech Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/ShareTechMono-Regular.woff2') format('woff2');
+}
+
+@layer base {
+  /* DARK THEME (true black + blue-tinted surfaces) — also :root fallback */
+  :root,
+  [data-theme="dark"] {
+    --color-bg-primary:    oklch(0 0 0);                /* absolute black */
+    --color-bg-secondary:  oklch(0.08 0.01 232);         /* near-black, panels pop over this */
+    --color-bg-tertiary:   oklch(0.2 0.014 232);        /* slightly lighter, hover/active */
+    --color-bg-card:       oklch(0.18 0.02 232 / 0.65);  /* card surfaces, lighter for contrast */
+    --color-bg-input:      oklch(0.11 0.014 232);       /* input fields, darker than card */
+    --color-bg-popover:    oklch(0.18 0.02 232);        /* solid opaque popover/modal bg */
+
+    --color-text-primary:   oklch(0.95 0.005 232);      /* near-white, tiny blue tint */
+    --color-text-secondary: oklch(0.75 0.025 232);       /* readable medium, blue-tinted */
+    --color-text-muted:     oklch(0.55 0.025 232);      /* dim but visible */
+    --color-text-accent:    oklch(0.7 0.1 232);         /* matches primary accent */
+
+    --color-border:        oklch(0.35 0.025 232);         /* visible border */
+    --color-border-light:  oklch(0.22 0.015 232);       /* subtle border */
+
+    --color-accent:        oklch(0.7 0.1 232);          /* primary blue-teal */
+    --color-accent-hover:  oklch(0.78 0.1 232);         /* brighter on hover */
+    --color-accent-muted:  oklch(0.7 0.05 232 / 0.15); /* translucent for backgrounds */
+
+    --color-signal-excellent: oklch(0.72 0.17 155);     /* green */
+    --color-signal-good:      oklch(0.78 0.18 130);     /* lime-green */
+    --color-signal-fair:      oklch(0.78 0.15 90);      /* yellow-amber */
+    --color-signal-poor:      oklch(0.7 0.17 55);       /* orange */
+    --color-signal-none:      oklch(0.65 0.22 25);      /* red */
+
+    --color-success:       oklch(0.72 0.17 155);        /* green */
+    --color-warning:       oklch(0.78 0.15 80);         /* amber/yellow */
+    --color-error:         oklch(0.65 0.22 25);         /* red */
+  }
+
+  /* LIGHT THEME (soft off-white + blue-tinted, high contrast, same hue 232) */
+  [data-theme="light"] {
+    --color-bg-primary:    oklch(1 0 0);                  /* pure white */
+    --color-bg-secondary:  oklch(1 0 0);                  /* pure white, matches primary — no grey tint */
+    --color-bg-tertiary:   oklch(0.9 0.015 232);         /* hover/active, visible step */
+    --color-bg-card:       oklch(0.94 0.01 232 / 0.7);   /* grey-tinted glass, floats over white */
+    --color-bg-input:      oklch(0.985 0.003 232);       /* same as card */
+    --color-bg-popover:    oklch(0.97 0.005 232);        /* solid opaque popover/modal bg */
+
+    --color-text-primary:   oklch(0.18 0.02 232);        /* near-black, high contrast */
+    --color-text-secondary: oklch(0.35 0.035 232);        /* dark blue-gray, readable */
+    --color-text-muted:     oklch(0.5 0.03 232);         /* muted but legible */
+    --color-text-accent:    oklch(0.5 0.14 232);         /* darker accent for light bg */
+
+    --color-border:        oklch(0.78 0.025 232);         /* visible blue-tinted border */
+    --color-border-light:  oklch(0.9 0.012 232);         /* subtle border */
+
+    --color-accent:        oklch(0.58 0.14 232);         /* deeper blue-teal for light bg */
+    --color-accent-hover:  oklch(0.5 0.15 232);          /* darker on hover */
+    --color-accent-muted:  oklch(0.58 0.14 232 / 0.1);  /* translucent accent */
+
+    --color-signal-excellent: oklch(0.55 0.17 155);      /* green, dark enough for light bg */
+    --color-signal-good:      oklch(0.55 0.16 130);      /* lime */
+    --color-signal-fair:      oklch(0.58 0.15 85);       /* amber */
+    --color-signal-poor:      oklch(0.55 0.18 50);       /* orange */
+    --color-signal-none:      oklch(0.52 0.2 25);        /* red */
+
+    --color-success:       oklch(0.55 0.17 155);
+    --color-warning:       oklch(0.58 0.15 85);
+    --color-error:         oklch(0.52 0.2 25);
+  }
+
+  /* FALLEN THEME (Fallout phosphor green CRT) */
+  [data-theme="fallen"] {
+    --color-bg-primary: #050505;
+    --color-bg-secondary: #0a0a0a;
+    --color-bg-tertiary: #141414;
+    --color-bg-card: rgba(10, 10, 10, 0.7);
+    --color-bg-input: #030303;
+    --color-bg-popover: #0f0f0f;        /* solid opaque popover/modal bg */
+
+    --color-text-primary: #33ff33;      /* phosphor green */
+    --color-text-secondary: #33cc33;
+    --color-text-muted: #1a991a;
+    --color-text-accent: #33ff33;
+
+    --color-border: #1a3a1a;
+    --color-border-light: #0d1f0d;
+
+    --color-accent: #33ff33;
+    --color-accent-hover: #44ff44;
+    --color-accent-muted: rgba(51, 255, 51, 0.15);
+
+    /* All signal levels as shades of green */
+    --color-signal-excellent: #33ff33;
+    --color-signal-good: #28cc28;
+    --color-signal-fair: #1f991f;
+    --color-signal-poor: #146614;
+    --color-signal-none: #0a330a;
+
+    --color-success: #33ff33;
+    --color-warning: #22bb22;
+    --color-error: #ff3333;             /* keep red for critical */
+  }
+
+  /* Fallen monospace font override */
+  [data-theme="fallen"],
+  [data-theme="fallen"] * {
+    font-family: 'Share Tech Mono', monospace !important;
+  }
+
+  /* Smooth theme transitions */
+  html {
+    transition: background-color 0.3s ease, color 0.3s ease;
+  }
+
+  /* Focus outlines adapt to theme */
+  *:focus-visible {
+    @apply outline-2 outline-offset-2;
+    outline-color: var(--color-accent);
+  }
+
+  /* Scrollbar theming */
+  ::-webkit-scrollbar {
+    @apply w-2 h-2;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: var(--color-bg-secondary);
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-bg-tertiary);
+    border-radius: 9999px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--color-text-muted);
+  }
+}
+
+/* ========================================
+   FALLEN CRT VISUAL EFFECTS
+   Pure CSS, zero cost when other themes active
+   ======================================== */
+
+/* Scanlines overlay */
+[data-theme="fallen"] body::after {
+  content: '';
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 9999;
+  background: repeating-linear-gradient(
+    0deg,
+    rgba(0, 0, 0, 0.06) 0px,
+    rgba(0, 0, 0, 0.06) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+}
+
+/* Vignette (darkened edges) */
+[data-theme="fallen"] body::before {
+  content: '';
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 9998;
+  background: radial-gradient(
+    ellipse at center,
+    transparent 60%,
+    rgba(0, 0, 0, 0.3) 100%
+  );
+}
+
+/* Phosphor glow on headings and terminal text */
+[data-theme="fallen"] h1,
+[data-theme="fallen"] h2,
+[data-theme="fallen"] h3,
+[data-theme="fallen"] .terminal,
+[data-theme="fallen"] .font-mono {
+  text-shadow: 0 0 8px rgba(51, 255, 51, 0.6),
+               0 0 16px rgba(51, 255, 51, 0.3);
+}
+
+/* Subtle phosphor glow on regular text */
+[data-theme="fallen"] p,
+[data-theme="fallen"] span,
+[data-theme="fallen"] label,
+[data-theme="fallen"] dt,
+[data-theme="fallen"] dd,
+[data-theme="fallen"] option,
+[data-theme="fallen"] button {
+  text-shadow: 0 0 4px rgba(51, 255, 51, 0.3);
+}
+
+/* Subtle screen flicker */
+[data-theme="fallen"] #root {
+  animation: crt-flicker 0.15s infinite;
+}
+
+/* Card/panel glow border in Fallen mode */
+[data-theme="fallen"] .card,
+[data-theme="fallen"] .panel-wrapper > div {
+  border-color: #1a3a1a !important;
+  box-shadow: 0 0 6px rgba(51, 255, 51, 0.1),
+              inset 0 0 6px rgba(51, 255, 51, 0.05);
+}
+
+/* Green-tinted selection */
+[data-theme="fallen"] ::selection {
+  background: rgba(51, 255, 51, 0.3);
+  color: #33ff33;
+}
+
+/* ========================================
+   BUTTON UTILITIES
+   Unified button patterns — consistent hover, focus-visible, active, disabled
+   ======================================== */
+@layer components {
+  /* Primary action button — filled, visually dominant */
+  .btn-primary {
+    @apply px-4 py-2 rounded-lg font-medium text-sm
+           bg-theme-accent text-white
+           hover:bg-theme-accent-hover
+           active:scale-[0.98]
+           transition-all outline-none
+           focus-visible:ring-2 focus-visible:ring-theme-accent focus-visible:ring-offset-2 focus-visible:ring-offset-theme-bg-primary
+           disabled:opacity-50 disabled:cursor-not-allowed disabled:active:scale-100;
+  }
+
+  /* Secondary button — ghost/outline style */
+  .btn-secondary {
+    @apply px-4 py-2 rounded-lg font-medium text-sm
+           text-theme-text-secondary bg-theme-bg-tertiary
+           hover:text-theme-text-primary
+           active:scale-[0.98]
+           transition-all outline-none
+           focus-visible:ring-2 focus-visible:ring-theme-accent focus-visible:ring-offset-2 focus-visible:ring-offset-theme-bg-primary
+           disabled:opacity-50 disabled:cursor-not-allowed disabled:active:scale-100;
+  }
+  .btn-secondary:hover {
+    background: color-mix(in srgb, var(--color-bg-tertiary) 80%, transparent);
+  }
+
+  /* Danger/destructive button */
+  .btn-danger {
+    @apply px-4 py-2 rounded-lg font-medium text-sm
+           text-theme-error
+           active:scale-[0.98]
+           transition-all outline-none
+           focus-visible:ring-2 focus-visible:ring-theme-error focus-visible:ring-offset-2 focus-visible:ring-offset-theme-bg-primary
+           disabled:opacity-50 disabled:cursor-not-allowed disabled:active:scale-100;
+    background: color-mix(in srgb, var(--color-error) 15%, transparent);
+  }
+  .btn-danger:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--color-error) 25%, transparent);
+  }
+
+  /* Success button (for connect, apply, etc.) */
+  .btn-success {
+    @apply px-4 py-2 rounded-lg font-medium text-sm
+           text-theme-success
+           active:scale-[0.98]
+           transition-all outline-none
+           focus-visible:ring-2 focus-visible:ring-theme-success focus-visible:ring-offset-2 focus-visible:ring-offset-theme-bg-primary
+           disabled:opacity-50 disabled:cursor-not-allowed disabled:active:scale-100;
+    background: color-mix(in srgb, var(--color-success) 15%, transparent);
+  }
+  .btn-success:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--color-success) 25%, transparent);
+  }
+
+  /* Warning button (for actions that need caution) */
+  .btn-warning {
+    @apply px-4 py-2 rounded-lg font-medium text-sm
+           bg-theme-warning text-white
+           hover:opacity-90
+           active:scale-[0.98]
+           transition-all outline-none
+           focus-visible:ring-2 focus-visible:ring-theme-warning focus-visible:ring-offset-2 focus-visible:ring-offset-theme-bg-primary
+           disabled:opacity-50 disabled:cursor-not-allowed disabled:active:scale-100;
+  }
+
+  /* Icon-only button (panel headers, toolbars) */
+  .btn-icon {
+    @apply p-2 rounded-lg
+           text-theme-text-secondary
+           hover:text-theme-accent hover:bg-theme-bg-tertiary
+           transition-colors outline-none
+           focus-visible:ring-2 focus-visible:ring-theme-accent focus-visible:ring-offset-1 focus-visible:ring-offset-theme-bg-primary
+           disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  /* Icon-only button with danger hover */
+  .btn-icon-danger {
+    @apply p-2 rounded-lg
+           text-theme-text-secondary
+           hover:text-theme-error hover:bg-theme-bg-tertiary
+           transition-colors outline-none
+           focus-visible:ring-2 focus-visible:ring-theme-error focus-visible:ring-offset-1 focus-visible:ring-offset-theme-bg-primary
+           disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  /* Ghost button (sidebar items, minimal visual weight) */
+  .btn-ghost {
+    @apply px-3 py-2 rounded-lg text-sm
+           text-theme-text-secondary
+           hover:text-theme-text-primary
+           transition-colors outline-none
+           focus-visible:ring-2 focus-visible:ring-theme-accent focus-visible:ring-offset-1 focus-visible:ring-offset-theme-bg-primary
+           disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-ghost:hover {
+    background: color-mix(in srgb, var(--color-bg-tertiary) 50%, transparent);
+  }
+}
+
+/* ========================================
+   INPUT UTILITIES
+   Unified input/select patterns — consistent border, focus, disabled
+   ======================================== */
+@layer components {
+  /* Standard text input */
+  .input {
+    @apply w-full px-3 py-2 rounded-lg text-sm
+           bg-theme-bg-input border border-theme-border
+           text-theme-text-primary placeholder:text-theme-text-muted
+           outline-none
+           focus-visible:ring-2 focus-visible:ring-theme-accent focus-visible:border-theme-accent
+           transition-colors
+           disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  /* Select dropdown */
+  .select {
+    @apply px-3 py-2 rounded-lg text-sm
+           bg-theme-bg-input border border-theme-border
+           text-theme-text-primary
+           outline-none
+           focus-visible:ring-2 focus-visible:ring-theme-accent focus-visible:border-theme-accent
+           transition-colors cursor-pointer
+           disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  /* Compact input (for inline/table use) */
+  .input-compact {
+    @apply px-2 py-1 rounded text-xs
+           bg-theme-bg-input border border-theme-border
+           text-theme-text-primary placeholder:text-theme-text-muted
+           outline-none
+           focus-visible:ring-1 focus-visible:ring-theme-accent
+           transition-colors
+           disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  /* Compact select (for inline use like interval pickers) */
+  .select-compact {
+    @apply px-2 py-1 rounded text-xs
+           bg-theme-bg-input border border-theme-border
+           text-theme-text-primary
+           outline-none
+           focus-visible:ring-1 focus-visible:ring-theme-accent
+           transition-colors cursor-pointer
+           disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+}
+
+/* ========================================
+   STATE UTILITIES
+   Standardized loading, empty, and error state patterns
+   ======================================== */
+@layer components {
+  /* Loading spinner — standardized size and animation */
+  .loading-spinner {
+    @apply animate-spin rounded-full h-8 w-8 border-2 border-theme-border border-t-theme-accent;
+  }
+
+  .loading-spinner-sm {
+    @apply animate-spin rounded-full h-5 w-5 border-2 border-theme-border border-t-theme-accent;
+  }
+
+  /* Loading container — centers the spinner with optional message */
+  .loading-state {
+    @apply flex flex-col items-center justify-center py-8 gap-3 text-sm text-theme-text-muted;
+  }
+
+  /* Empty state container */
+  .empty-state {
+    @apply flex flex-col items-center justify-center py-8 gap-2 text-center;
+  }
+
+  /* Error state container */
+  .error-state {
+    @apply flex flex-col items-center justify-center py-6 gap-2 text-center;
+  }
+}
+
+/* ========================================
+   COMPONENT STYLES (theme-aware)
+   ======================================== */
+@layer components {
+  /* Card component base */
+  .card {
+    background: var(--color-bg-card);
+    border: 2px solid var(--color-border);
+    border-radius: 1rem;
+    box-shadow: 0 1px 3px oklch(0 0 0 / 0.3), 0 0 0 1px oklch(0.2 0.01 232 / 0.1);
+    backdrop-filter: blur(12px) saturate(150%);
+    -webkit-backdrop-filter: blur(12px) saturate(150%);
+  }
+
+  /* Light theme: stronger external shadow on cards */
+  [data-theme="light"] .card {
+    box-shadow: 0 4px 12px oklch(0 0 0 / 0.08), 0 0 0 1px oklch(0.78 0.025 232 / 0.3);
+  }
+
+  /* Internal cards inside panel content: less border, no shadow */
+  .panel-wrapper .card,
+  .react-grid-item .card {
+    box-shadow: none;
+    border-width: 1px;
+  }
+
+  /* Signal bar styles */
+  .signal-bar {
+    @apply w-2 rounded-t transition-all duration-300;
+  }
+
+  .signal-bar-inactive {
+    background: var(--color-bg-tertiary);
+  }
+
+  /* AT Terminal styles */
+  .terminal {
+    @apply font-mono text-sm p-4 rounded-lg;
+    background: var(--color-bg-primary);
+    color: var(--color-text-accent);
+  }
+
+  .terminal-input {
+    @apply bg-transparent border-none outline-none focus-visible:ring-2 focus-visible:ring-offset-1 w-full;
+    color: var(--color-text-accent);
+    --tw-ring-color: var(--color-accent);
+    --tw-ring-offset-color: var(--color-bg-primary);
+  }
+}
+
+/* Utility classes */
+@layer utilities {
+  /* Animation for pulsing signal indicator */
+  .animate-signal-pulse {
+    animation: signal-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  }
+
+  @keyframes signal-pulse {
+    0%, 100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.5;
+    }
+  }
+
+  /* Hide scrollbar but keep functionality */
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* React Grid Layout Customizations */
+.react-grid-layout {
+  position: relative;
+}
+
+.react-grid-item {
+  transition: all 200ms ease;
+  transition-property: left, top, width, height;
+}
+
+.react-grid-item.cssTransforms {
+  transition-property: transform, width, height;
+}
+
+.react-grid-item.resizing {
+  z-index: 1;
+  will-change: width, height;
+}
+
+.react-grid-item.react-draggable-dragging {
+  transition: none;
+  z-index: 100;
+  will-change: transform;
+}
+
+.react-grid-item.dropping {
+  visibility: hidden;
+}
+
+.react-grid-item.react-grid-placeholder {
+  background: var(--color-accent-muted);
+  border: 2px dashed var(--color-accent);
+  border-radius: 1rem;
+  transition-duration: 100ms;
+  z-index: 2;
+  user-select: none;
+}
+
+/* Panel wrapper styling */
+.panel-wrapper {
+  @apply h-full;
+}
+
+.panel-wrapper > div {
+  @apply h-full;
+}
+
+/* Resize handle */
+.react-resizable-handle {
+  position: absolute;
+  width: 20px;
+  height: 20px;
+  bottom: 0;
+  right: 0;
+  cursor: se-resize;
+  z-index: 20;
+}
+
+.react-resizable-handle::after {
+  content: '';
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  width: 8px;
+  height: 8px;
+  border-right: 2px solid var(--color-text-muted);
+  border-bottom: 2px solid var(--color-text-muted);
+  border-radius: 0 0 2px 0;
+  transition: border-color 0.2s;
+}
+
+.react-grid-item:hover .react-resizable-handle::after {
+  border-color: var(--color-accent);
+}
+
+/* Drag handle styling */
+.panel-drag-handle {
+  touch-action: none;
+}
+
+/* CRT flicker keyframes */
+@keyframes crt-flicker {
+  0%, 100% { opacity: 0.97; }
+  50% { opacity: 1; }
+}
