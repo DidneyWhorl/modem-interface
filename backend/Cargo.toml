@@ -1,6 +1,6 @@
 [package]
 name = "modem-interface"
-version = "1.4.0"
+version = "1.4.1"
 edition = "2021"
 authors = ["OpenWRT Modem Interface Team"]
 description = "Web interface for cellular modem management on OpenWRT"

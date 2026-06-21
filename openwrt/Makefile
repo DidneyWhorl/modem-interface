@@ -1,13 +1,13 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=modem-interface
-PKG_VERSION:=1.0.80
+PKG_VERSION:=1.4.1
 PKG_RELEASE:=1
 
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
 PKG_SOURCE:=$(PKG_NAME)_$(PKG_VERSION)-$(PKG_RELEASE)_aarch64_cortex-a53.ipk
 PKG_SOURCE_URL:=https://packages.ctrl-modem.com/stable/feed/aarch64_cortex-a53/
-PKG_HASH:=skip
+PKG_HASH:=694894a67205e71457b1236f20d3f57c55464ce4d760ccf47d8262003595858a
 
 PKG_MAINTAINER:=agccc <agccc@netsolution.shop>
 PKG_LICENSE:=MIT

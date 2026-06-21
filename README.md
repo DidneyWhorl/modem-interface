@@ -45,13 +45,19 @@ likely to work as well.
 
 ## Install
 
-Current stable version: **1.3.0**
+Current stable version: **1.4.1**
 
-On your OpenWRT router, add the CTRL-Modem package feed and install:
+OpenWRT ships one of two package managers depending on its version: **`opkg`**
+(OpenWRT 23.05 and earlier) and **`apk`** (apk-tools 3.x, OpenWRT 24.10 and
+newer). Use the block that matches your router. In both cases, replace `<arch>`
+with your router's architecture (e.g. `aarch64_cortex-a53`,
+`arm_cortex-a7_neon-vfpv4`, `mipsel_24kc`).
+
+### With opkg (OpenWRT 23.05 and earlier)
 
 ```sh
 # Add the CTRL-Modem stable feed
-echo 'src/gz ctrl_modem https://packages.ctrl-modem.com/stable/' >> /etc/opkg/customfeeds.conf
+echo 'src/gz ctrl_modem https://packages.ctrl-modem.com/stable/feed/<arch>' >> /etc/opkg/customfeeds.conf
 
 # Update package lists and install
 opkg update
@@ -59,6 +65,23 @@ opkg install modem-interface
 
 # Optional: add the menu entry to the LuCI menu
 opkg install luci-app-ctrl-modem
+```
+
+### With apk (OpenWRT 24.10 and newer)
+
+```sh
+# Trust the feed signing key (apk verifies packages against keys in /etc/apk/keys/)
+wget -O /etc/apk/keys/ctrl-modem-ec.pem https://packages.ctrl-modem.com/stable/apk/ctrl-modem-ec.pem
+
+# Add the CTRL-Modem stable feed (apk auto-appends your router's <arch>)
+echo 'https://packages.ctrl-modem.com/stable/apk' >> /etc/apk/repositories.d/customfeeds.list
+
+# Update package lists and install
+apk update
+apk add modem-interface
+
+# Optional: add the menu entry to the LuCI menu
+apk add luci-app-ctrl-modem
 ```
 
 ## First run

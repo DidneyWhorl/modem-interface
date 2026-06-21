@@ -97,6 +97,31 @@ opkg install modem-interface    # first install
 opkg upgrade modem-interface    # subsequent upgrades
 ```
 
+### Via apk from Feed
+
+For OpenWrt 24.10+ routers running apk-tools 3.x (the `apk` package manager
+instead of `opkg`):
+
+```bash
+# One-time setup: trust the feed signing key.
+# apk verifies every package against the EC P-256 public key in /etc/apk/keys/;
+# this is a different key from the opkg usign key (openwrt/keys/modem-interface-feed.pub).
+wget -O /etc/apk/keys/ctrl-modem-ec.pem https://packages.ctrl-modem.com/stable/apk/ctrl-modem-ec.pem
+
+# Add the public feed. apk auto-appends your router's <arch> to a bare feed URL,
+# so point it at the apk feed root (NOT a per-arch subdirectory).
+# repositories.d/ ships in OpenWrt apk images — no mkdir needed.
+echo "https://packages.ctrl-modem.com/stable/apk" >> /etc/apk/repositories.d/customfeeds.list
+
+# Then install/upgrade (full signature verification, no --allow-untrusted):
+apk update
+apk add modem-interface       # first install
+apk add -u modem-interface    # subsequent upgrades
+
+# Optional: LuCI menu integration
+apk add luci-app-ctrl-modem
+```
+
 ### Via opkg from .ipk File
 
 ```bash

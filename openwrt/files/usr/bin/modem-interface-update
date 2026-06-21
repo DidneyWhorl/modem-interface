@@ -46,6 +46,14 @@ detect_feed_cache_dir() {
 
 FEED_CACHE_DIR=$(detect_feed_cache_dir)
 
+# Trusted-key locations for package verification.
+#   apk:  trust is enforced natively by `apk add -u` against keys in /etc/apk/keys/.
+#   opkg: there is no native verified-install for a local .ipk, so this script
+#         verifies the feed's usign-signed Packages index manually against the
+#         trusted usign public key(s) in /etc/opkg/keys/ and then pins the .ipk
+#         by the SHA256sum carried in that verified index.
+OPKG_USIGN_KEY_DIR="/etc/opkg/keys"
+
 # Detect the OpenWrt subtarget architecture (e.g. aarch64_cortex-a53).
 # Priority order (first non-empty wins):
 #   1. /etc/apk/arch               - OpenWrt's source of truth
@@ -399,6 +407,115 @@ release_lock() {
     rm -f "$LOCKFILE"
 }
 
+# --- apk version selection (pick HIGHEST, not first) ---
+#
+# `apk list --available/--installed` emits one line per matching version in NO
+# guaranteed sorted order. On a feed with keep-3 retention (e.g. 1.2.0-r1 /
+# 1.3.0-r1 / 1.4.0-r1 all present) taking the FIRST line can return an OLDER
+# version, which makes check_update()/do_apply suppress or downgrade a real
+# upgrade. These helpers select the line carrying the HIGHEST version instead.
+#
+# Version ordering is numeric-aware and honours the apk `-rN` revision suffix:
+#   1.10.0 > 1.9.0  (multi-digit, NOT lexical)
+#   1.4.0-r2 > 1.4.0-r1  (revision tie-break)
+# When the real `apk` binary is present we defer to `apk version -t` (the
+# canonical comparator, no network needed); otherwise a pure-shell dotted
+# numeric fallback is used so the logic is hermetically testable without apk.
+
+# Compare two apk version tokens (each may carry a trailing `-rN`).
+# Prints "gt", "lt", or "eq" describing $1 relative to $2.
+# Numeric-aware, dotted-component compare with `-rN` revision as a final
+# tie-break component. Pure shell — no apk, no network.
+_apk_ver_cmp_pure() {
+    a_ver="${1%-r*}"; a_rev="0"
+    case "$1" in *-r[0-9]*) a_rev="${1##*-r}" ;; esac
+    b_ver="${2%-r*}"; b_rev="0"
+    case "$2" in *-r[0-9]*) b_rev="${2##*-r}" ;; esac
+
+    # Compare the dotted version parts component-by-component, numerically.
+    # cmp_dotted signals via non-zero return (1=gt, 2=lt). The script runs under
+    # `set -e`, so capture the code in an AND-OR list — a bare call would abort
+    # at the cmp_dotted line before `$?` is read (and inside the $(...) used by
+    # _apk_ver_gt that silently yields empty output for the gt/lt cases).
+    dotted_rc=0
+    cmp_dotted "$a_ver" "$b_ver" || dotted_rc=$?
+    if [ "$dotted_rc" -eq 1 ]; then echo gt; return; fi
+    if [ "$dotted_rc" -eq 2 ]; then echo lt; return; fi
+
+    # Versions equal — break the tie on the numeric -rN revision.
+    a_rev=$(printf '%s' "$a_rev" | sed 's/[^0-9].*$//'); [ -n "$a_rev" ] || a_rev=0
+    b_rev=$(printf '%s' "$b_rev" | sed 's/[^0-9].*$//'); [ -n "$b_rev" ] || b_rev=0
+    if [ "$a_rev" -gt "$b_rev" ]; then echo gt
+    elif [ "$a_rev" -lt "$b_rev" ]; then echo lt
+    else echo eq
+    fi
+}
+
+# Numerically compare two dotted version strings (e.g. 1.10.0 vs 1.9.0).
+# Returns: 1 if $1 > $2, 2 if $1 < $2, 0 if equal. Pure shell.
+cmp_dotted() {
+    v1="$1"; v2="$2"
+    while [ -n "$v1" ] || [ -n "$v2" ]; do
+        c1="${v1%%.*}"; c2="${v2%%.*}"
+        [ -n "$c1" ] || c1=0
+        [ -n "$c2" ] || c2=0
+        # Strip any non-numeric suffix from a component defensively.
+        c1=$(printf '%s' "$c1" | sed 's/[^0-9].*$//'); [ -n "$c1" ] || c1=0
+        c2=$(printf '%s' "$c2" | sed 's/[^0-9].*$//'); [ -n "$c2" ] || c2=0
+        if [ "$c1" -gt "$c2" ]; then return 1; fi
+        if [ "$c1" -lt "$c2" ]; then return 2; fi
+        case "$v1" in *.*) v1="${v1#*.}" ;; *) v1="" ;; esac
+        case "$v2" in *.*) v2="${v2#*.}" ;; *) v2="" ;; esac
+    done
+    return 0
+}
+
+# Return 0 (true) if version token $1 is strictly greater than $2.
+# Prefers the canonical `apk version -t` comparator when apk is present (no
+# network required), falling back to the pure-shell dotted compare otherwise.
+_apk_ver_gt() {
+    if command -v apk >/dev/null 2>&1; then
+        # `apk version -t <a> <b>` prints one of < = > describing a vs b.
+        case "$(apk version -t "$1" "$2" 2>/dev/null)" in
+            '>') return 0 ;;
+            '<'|'=') return 1 ;;
+        esac
+        # Fall through to pure compare if apk produced no/unknown output.
+    fi
+    [ "$(_apk_ver_cmp_pure "$1" "$2")" = "gt" ]
+}
+
+# Read `apk list` lines on stdin and print the single line whose
+# `<pkg>-<version>-rN` first token carries the HIGHEST version. Lines whose
+# first token does not start with `<pkg>-` are ignored. Prints nothing if no
+# matching line is present. Pure-shell selection so it is hermetically testable
+# with a synthetic (deliberately unsorted) `apk list` block and no live apk feed.
+# Args: $1=package-name
+apk_highest_line() {
+    sel_pkg="$1"
+    best_line=""
+    best_ver=""
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        tok="${line%% *}"
+        case "$tok" in
+            "${sel_pkg}-"*) ;;
+            *) continue ;;
+        esac
+        ver="${tok#${sel_pkg}-}"
+        [ -n "$ver" ] || continue
+        if [ -z "$best_ver" ] || _apk_ver_gt "$ver" "$best_ver"; then
+            best_ver="$ver"
+            best_line="$line"
+        fi
+    done
+    # Print the winning line if any; always return success so callers under
+    # `set -e` treat "no match" as empty output, not a hard error (matches the
+    # prior awk behaviour).
+    [ -n "$best_line" ] && printf '%s\n' "$best_line"
+    return 0
+}
+
 # Get installed version
 get_installed_version() {
     if [ "$PKG_MGR" = "apk" ]; then
@@ -407,8 +524,10 @@ get_installed_version() {
         # grep-based parse broke silently. Use `apk list --installed` instead:
         # same stable format as `--available`, e.g.
         #   modem-interface-1.0.148-r1 aarch64_cortex-a53 {modem-interface} (...) [installed]
+        # Normally only one version is installed, but select the HIGHEST line
+        # defensively in case apk ever reports multiple installed versions.
         local line pkg_ver
-        line=$(apk list --installed "$PKG_NAME" 2>/dev/null | awk 'NF { print; exit }')
+        line=$(apk list --installed "$PKG_NAME" 2>/dev/null | apk_highest_line "$PKG_NAME")
         [ -z "$line" ] && return
         pkg_ver="${line%% *}"
         case "$pkg_ver" in
@@ -442,14 +561,18 @@ get_available_version() {
 #
 # Output format is:
 #   modem-interface-1.0.148-r1 aarch64_cortex-a53 {modem-interface} (...) [installed]
-# We take the first non-empty line, first whitespace-separated token, and
-# strip the `<pkg>-` prefix.
+# `apk list --available` emits one line PER available version in no guaranteed
+# order, so a keep-3 stable feed (1.2.0-r1 / 1.3.0-r1 / 1.4.0-r1) can put an
+# OLDER version first. Select the line carrying the HIGHEST version (via
+# apk_highest_line), take its first whitespace-separated token, and strip the
+# `<pkg>-` prefix. The returned `<version>-rN` keeps its revision suffix so it
+# still maps to a real `<pkg>-<version>-rN.apk` artifact (see get_apk_filename).
 #
 # Args: $1=package-name (default: modem-interface)
 get_apkindex_version() {
     local pkg="${1:-modem-interface}"
     local line pkg_ver
-    line=$(apk list --available "$pkg" 2>/dev/null | awk 'NF { print; exit }')
+    line=$(apk list --available "$pkg" 2>/dev/null | apk_highest_line "$pkg")
     [ -z "$line" ] && return
     # First whitespace-separated token: `<pkg>-<version>-rN`
     pkg_ver="${line%% *}"
@@ -526,6 +649,160 @@ get_feed_version() {
     fi
 }
 
+# --- opkg trust verification (fail-closed) ---
+#
+# The opkg path manually downloads a local .ipk and runs `opkg install <file>`,
+# which performs NO signature/checksum verification. To avoid turning a
+# compromised package host / MITM into root RCE, we verify trust ourselves:
+#
+#   1. usign-verify the feed's `Packages` index against the trusted public
+#      key(s) in /etc/opkg/keys/  (opkg_verify_packages_sig)
+#   2. pin the .ipk by the SHA256sum carried in that VERIFIED index
+#      (opkg_index_sha256 + opkg_verify_file_sha256)
+#
+# Every helper fails closed: a missing tool, missing key, bad signature, or
+# digest mismatch returns non-zero and the caller MUST abort the install.
+
+# Compute the SHA256 of a file, lowercase hex, no filename. Empty on failure.
+# Args: $1=file
+sha256_of() {
+    local f="$1"
+    [ -f "$f" ] || return 1
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$f" 2>/dev/null | cut -d' ' -f1
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$f" 2>/dev/null | awk '{print $NF}'
+    else
+        return 1
+    fi
+}
+
+# Verify a usign/signify detached signature over $packages using the trusted
+# public key(s) in OPKG_USIGN_KEY_DIR. Fails closed (non-zero) when:
+#   - usign/signify is unavailable
+#   - no trusted public key is present
+#   - the signature does not verify against any trusted key
+# Args: $1=packages_file $2=signature_file
+# Returns 0 only on a verified signature.
+opkg_verify_packages_sig() {
+    local packages="$1" sig="$2"
+
+    if [ ! -f "$packages" ] || [ ! -f "$sig" ]; then
+        log "ERROR: opkg verify: missing Packages or Packages.sig (fail closed)"
+        return 1
+    fi
+
+    local verifier=""
+    if command -v usign >/dev/null 2>&1; then
+        verifier="usign"
+    elif command -v signify >/dev/null 2>&1; then
+        verifier="signify"
+    else
+        log "ERROR: opkg verify: neither usign nor signify available — cannot verify feed signature (fail closed)"
+        return 1
+    fi
+
+    if [ ! -d "$OPKG_USIGN_KEY_DIR" ]; then
+        log "ERROR: opkg verify: trusted key dir $OPKG_USIGN_KEY_DIR not present (fail closed)"
+        return 1
+    fi
+
+    # Try each trusted public key; accept on the first that verifies.
+    local key found_key=0
+    for key in "$OPKG_USIGN_KEY_DIR"/*; do
+        [ -f "$key" ] || continue
+        found_key=1
+        # Note: no -q flag — OpenBSD signify lacks it; output is redirected anyway.
+        # usign and signify both accept: -V -m <msg> -p <pubkey> -x <sigfile>.
+        if "$verifier" -V -m "$packages" -p "$key" -x "$sig" >/dev/null 2>&1; then
+            log "opkg verify: Packages signature VERIFIED against $(basename "$key")"
+            return 0
+        fi
+    done
+
+    if [ "$found_key" -eq 0 ]; then
+        log "ERROR: opkg verify: no trusted public key found in $OPKG_USIGN_KEY_DIR (fail closed)"
+        return 1
+    fi
+
+    log "ERROR: opkg verify: Packages signature did NOT verify against any trusted key (fail closed)"
+    return 1
+}
+
+# Extract the SHA256sum field for a package from a (verified) Packages index.
+# Args: $1=packages_file $2=package-name
+# Prints the lowercase hex digest, or nothing if absent.
+opkg_index_sha256() {
+    local packages="$1" pkg="$2"
+    [ -f "$packages" ] || return 1
+    awk -v pkg="$pkg" '
+        /^Package: /{found=($2==pkg); next}
+        found && /^SHA256sum: /{print $2; exit}
+        found && /^$/{exit}
+    ' "$packages" 2>/dev/null
+}
+
+# Verify a downloaded file's SHA256 against an expected digest. Fails closed
+# (non-zero) on missing file, unavailable hasher, empty expected digest, or
+# mismatch.
+# Args: $1=file $2=expected_sha256
+opkg_verify_file_sha256() {
+    local file="$1" expected="$2"
+
+    if [ -z "$expected" ]; then
+        log "ERROR: opkg verify: no expected SHA256 in verified index (fail closed)"
+        return 1
+    fi
+
+    local actual
+    actual=$(sha256_of "$file")
+    if [ -z "$actual" ]; then
+        log "ERROR: opkg verify: could not compute SHA256 of $file (no hasher? fail closed)"
+        return 1
+    fi
+
+    # Case-insensitive compare.
+    local exp_lc act_lc
+    exp_lc=$(printf '%s' "$expected" | tr 'A-Z' 'a-z')
+    act_lc=$(printf '%s' "$actual" | tr 'A-Z' 'a-z')
+    if [ "$exp_lc" != "$act_lc" ]; then
+        log "ERROR: opkg verify: SHA256 mismatch for $file (expected $expected, got $actual) — fail closed"
+        return 1
+    fi
+
+    log "opkg verify: SHA256 OK for $(basename "$file")"
+    return 0
+}
+
+# Download + usign-verify the feed Packages index for the opkg trust check.
+# Writes the verified index to "$1" on success. Fails closed.
+# Args: $1=dest_packages_file $2=feed_url
+opkg_fetch_verified_index() {
+    local dest="$1" feed_url="$2"
+    local cache_bust="t=$(date +%s)"
+    local sig="$dest.sig"
+
+    rm -f "$dest" "$sig"
+
+    if ! download "$feed_url/Packages?$cache_bust" "$dest"; then
+        log "ERROR: opkg verify: failed to download Packages (fail closed)"
+        return 1
+    fi
+    if ! download "$feed_url/Packages.sig?$cache_bust" "$sig"; then
+        log "ERROR: opkg verify: failed to download Packages.sig (fail closed)"
+        rm -f "$dest" "$sig"
+        return 1
+    fi
+
+    if ! opkg_verify_packages_sig "$dest" "$sig"; then
+        rm -f "$dest" "$sig"
+        return 1
+    fi
+
+    rm -f "$sig"
+    return 0
+}
+
 # Upgrade a companion package if it is installed and a newer version is in the feed
 # Args: $1=package-name
 upgrade_companion() {
@@ -552,32 +829,21 @@ upgrade_companion() {
             return 0
         fi
 
-        local comp_filename=$(get_apk_filename "$pkg")
-        if [ -z "$comp_filename" ] || [ -z "$feed_url" ]; then
-            log "  $pkg: cannot determine download URL, skipping"
-            return 0
-        fi
-
-        local cache_bust="t=$(date +%s)"
-        local comp_url="$feed_url/$comp_filename?$cache_bust"
-        local comp_path="/tmp/$comp_filename"
-
-        log "  $pkg: upgrading $comp_ver -> $comp_available"
-        if download "$comp_url" "$comp_path"; then
-            apk add --allow-untrusted "$comp_path" 2>&1 | while read -r line; do log "apk: $line"; done || true
-            rm -f "$comp_path"
-            local comp_new=$(apk info -v "$pkg" 2>/dev/null | grep "^${pkg}-" | head -1)
-            if [ -n "$comp_new" ]; then
-                local comp_new_ver="${comp_new#${pkg}-}"
-                comp_new_ver=$(echo "$comp_new_ver" | sed 's/-r[0-9]*$//')
-                if [ "$comp_new_ver" != "$comp_ver" ]; then
-                    log "  $pkg: upgraded to $comp_new_ver"
-                else
-                    log "  $pkg: upgrade may have failed (version still $comp_ver)"
-                fi
+        # Trusted upgrade from the signed index. `apk add -u <pkg>` verifies the
+        # feed signature against /etc/apk/keys/ and actually upgrades (the
+        # `apk upgrade` no-op bug on apk-tools 3.x does not affect `apk add -u`).
+        # No --allow-untrusted, no manual .apk download.
+        log "  $pkg: upgrading $comp_ver -> $comp_available (trusted apk add -u)"
+        apk add -u "$pkg" 2>&1 | while read -r line; do log "apk: $line"; done || true
+        local comp_new=$(apk info -v "$pkg" 2>/dev/null | grep "^${pkg}-" | head -1)
+        if [ -n "$comp_new" ]; then
+            local comp_new_ver="${comp_new#${pkg}-}"
+            comp_new_ver=$(echo "$comp_new_ver" | sed 's/-r[0-9]*$//')
+            if [ "$comp_new_ver" != "$comp_ver" ]; then
+                log "  $pkg: upgraded to $comp_new_ver"
+            else
+                log "  $pkg: upgrade may have failed (version still $comp_ver)"
             fi
-        else
-            log "  $pkg: download failed, skipping"
         fi
         return
     fi
@@ -600,9 +866,27 @@ upgrade_companion() {
         return 0
     fi
 
-    local comp_filename=$(get_ipk_filename "$pkg")
-    if [ -z "$comp_filename" ] || [ -z "$feed_url" ]; then
-        log "  $pkg: cannot determine download URL, skipping"
+    if [ -z "$feed_url" ]; then
+        log "  $pkg: cannot determine feed URL, skipping"
+        return 0
+    fi
+
+    # Verify the signed feed index before trusting any Filename/SHA256 from it.
+    # Fail closed: on any verification failure, skip the companion install
+    # entirely (no unverified .ipk reaches opkg).
+    local verified_idx="/tmp/modem-interface-companion-Packages"
+    if ! opkg_fetch_verified_index "$verified_idx" "$feed_url"; then
+        log "  $pkg: feed index verification FAILED, skipping (fail closed)"
+        rm -f "$verified_idx"
+        return 0
+    fi
+
+    local comp_filename=$(awk -v pkg="$pkg" '/^Package: /{found=($2==pkg); next} found && /^Filename: /{print $2; exit} found && /^$/{exit}' "$verified_idx" 2>/dev/null)
+    local comp_sha=$(opkg_index_sha256 "$verified_idx" "$pkg")
+    rm -f "$verified_idx"
+
+    if [ -z "$comp_filename" ]; then
+        log "  $pkg: not found in verified index, skipping"
         return 0
     fi
 
@@ -611,23 +895,37 @@ upgrade_companion() {
     local comp_path="/tmp/$comp_filename"
 
     log "  $pkg: upgrading $comp_installed -> $comp_available"
-    if download "$comp_url" "$comp_path"; then
-        opkg install "$comp_path" 2>&1 | while read -r line; do log "opkg: $line"; done || true
-        rm -f "$comp_path"
-        local comp_new=$(opkg status "$pkg" 2>/dev/null | grep "^Version:" | cut -d' ' -f2)
-        if [ "$comp_new" != "$comp_installed" ]; then
-            log "  $pkg: upgraded to $comp_new"
-        else
-            log "  $pkg: upgrade may have failed (version still $comp_installed)"
-        fi
-    else
+    if ! download "$comp_url" "$comp_path"; then
         log "  $pkg: download failed, skipping"
+        return 0
+    fi
+
+    # Pin the .ipk by the SHA256 from the VERIFIED index. Mismatch -> fail closed.
+    if ! opkg_verify_file_sha256 "$comp_path" "$comp_sha"; then
+        log "  $pkg: package integrity check FAILED, skipping install (fail closed)"
+        rm -f "$comp_path"
+        return 0
+    fi
+
+    opkg install "$comp_path" 2>&1 | while read -r line; do log "opkg: $line"; done || true
+    rm -f "$comp_path"
+    local comp_new=$(opkg status "$pkg" 2>/dev/null | grep "^Version:" | cut -d' ' -f2)
+    if [ "$comp_new" != "$comp_installed" ]; then
+        log "  $pkg: upgraded to $comp_new"
+    else
+        log "  $pkg: upgrade may have failed (version still $comp_installed)"
     fi
 }
 
-# Apply the update by downloading the package directly and installing it.
-# This bypasses "opkg upgrade" / "apk upgrade" which can silently do nothing
-# on some OpenWRT configurations even when the feed has a newer version available.
+# Apply the update with package-trust verification, failing closed on any
+# verification failure (the device stays on its current working version rather
+# than installing something unverified).
+#
+#   apk path:  trusted `apk add -u` from the signed index (keys in
+#              /etc/apk/keys/). No --allow-untrusted, no manual .apk download.
+#   opkg path: keep the no-hang manual download, but usign-verify the feed
+#              index against /etc/opkg/keys/ and pin the .ipk by the SHA256
+#              carried in that verified index before `opkg install`.
 apply_update() {
     local installed=$(get_installed_version)
     log "Applying update from $installed..."
@@ -640,45 +938,19 @@ EOF
     local feed_url=$(get_feed_url)
 
     if [ "$PKG_MGR" = "apk" ]; then
-        local apk_filename=$(get_apk_filename)
-
-        if [ -n "$feed_url" ] && [ -n "$apk_filename" ]; then
-            local cache_bust="t=$(date +%s)"
-            local apk_url="$feed_url/$apk_filename?$cache_bust"
-            local apk_path="/tmp/$apk_filename"
-
-            log "Downloading $apk_filename from feed..."
-            if download "$apk_url" "$apk_path"; then
-                log "Installing $apk_path via apk add..."
-                local install_rc=0
-                apk add --allow-untrusted "$apk_path" 2>&1 | while read -r line; do log "apk: $line"; done || install_rc=$?
-                rm -f "$apk_path"
-
-                local new_version=$(get_installed_version)
-                if [ "$new_version" != "$installed" ]; then
-                    log "Core update successful: $installed -> $new_version"
-                    log "Checking companion packages..."
-                    upgrade_companion "luci-app-ctrl-modem"
-                    cat > "$STATUS_FILE" <<EOF
-{"status":"completed","previous_version":"$installed","new_version":"$new_version","timestamp":"$(date -Iseconds 2>/dev/null || date)"}
-EOF
-                    return 0
-                fi
-                log "apk add exited with code $install_rc but version unchanged"
-            else
-                log "ERROR: Failed to download $apk_url"
-            fi
-        else
-            log "WARNING: Cannot determine feed URL ($feed_url) or filename ($apk_filename), trying apk upgrade"
-        fi
-
-        # Fallback: try apk upgrade
-        log "Trying apk upgrade as fallback..."
-        apk upgrade --allow-untrusted "$PKG_NAME" 2>&1 | while read -r line; do log "apk: $line"; done || true
+        # Trusted upgrade from the signed, refreshed index. `refresh_feed` already
+        # ran `apk update`, so the index is fresh. `apk add -u <pkg>` pulls from
+        # the trusted feed, verifies the signature against /etc/apk/keys/, and
+        # actually upgrades (unlike `apk upgrade`, a no-op on apk-tools 3.x).
+        # No --allow-untrusted, no manual .apk download — a verification failure
+        # makes apk exit non-zero and we fail closed on the current version.
+        log "Installing $PKG_NAME via trusted 'apk add -u'..."
+        local install_rc=0
+        apk add -u "$PKG_NAME" 2>&1 | while read -r line; do log "apk: $line"; done || install_rc=$?
 
         local new_version=$(get_installed_version)
         if [ "$new_version" != "$installed" ]; then
-            log "Core update successful via apk upgrade: $installed -> $new_version"
+            log "Core update successful: $installed -> $new_version"
             log "Checking companion packages..."
             upgrade_companion "luci-app-ctrl-modem"
             cat > "$STATUS_FILE" <<EOF
@@ -687,56 +959,80 @@ EOF
             return 0
         fi
 
-        log "ERROR: Update failed (version still $installed)"
+        log "ERROR: Update failed via 'apk add -u' (rc=$install_rc, version still $installed) — staying on current trusted version (fail closed)"
         cat > "$STATUS_FILE" <<EOF
 {"status":"failed","version":"$installed","timestamp":"$(date -Iseconds 2>/dev/null || date)"}
 EOF
         return 2
     fi
 
-    # opkg path
-    local ipk_filename=$(get_ipk_filename)
-
-    if [ -n "$feed_url" ] && [ -n "$ipk_filename" ]; then
-        # Direct download and install (bypasses opkg upgrade issues)
-        local cache_bust="t=$(date +%s)"
-        local ipk_url="$feed_url/$ipk_filename?$cache_bust"
-        local ipk_path="/tmp/$ipk_filename"
-
-        log "Downloading $ipk_filename from feed..."
-        if download "$ipk_url" "$ipk_path"; then
-            log "Installing $ipk_path via opkg install..."
-            local install_rc=0
-            opkg install "$ipk_path" 2>&1 | while read -r line; do log "opkg: $line"; done || install_rc=$?
-            rm -f "$ipk_path"
-
-            local new_version=$(get_installed_version)
-            if [ "$new_version" != "$installed" ]; then
-                log "Core update successful: $installed -> $new_version"
-                # Upgrade companion packages if installed
-                log "Checking companion packages..."
-                upgrade_companion "luci-app-ctrl-modem"
-                cat > "$STATUS_FILE" <<EOF
-{"status":"completed","previous_version":"$installed","new_version":"$new_version","timestamp":"$(date -Iseconds 2>/dev/null || date)"}
+    # opkg path — keep the no-hang manual-download architecture, but verify
+    # trust before install: usign-verify the feed index, then pin the .ipk by
+    # the SHA256 carried in that verified index. Any failure => fail closed.
+    if [ -z "$feed_url" ]; then
+        log "ERROR: Cannot determine feed URL — cannot perform verified install (fail closed)"
+        cat > "$STATUS_FILE" <<EOF
+{"status":"failed","version":"$installed","timestamp":"$(date -Iseconds 2>/dev/null || date)"}
 EOF
-                return 0
-            fi
-            log "opkg install exited with code $install_rc but version unchanged"
-        else
-            log "ERROR: Failed to download $ipk_url"
-        fi
-    else
-        log "WARNING: Cannot determine feed URL ($feed_url) or filename ($ipk_filename), trying opkg upgrade"
+        return 2
     fi
 
-    # Fallback: try opkg upgrade (may not work but worth a shot)
-    log "Trying opkg upgrade as fallback..."
-    opkg upgrade "$PKG_NAME" 2>&1 | while read -r line; do log "opkg: $line"; done || true
+    # 1. Download + usign-verify the feed Packages index against /etc/opkg/keys/.
+    local verified_idx="/tmp/modem-interface-verified-Packages"
+    if ! opkg_fetch_verified_index "$verified_idx" "$feed_url"; then
+        log "ERROR: opkg feed index could not be verified — aborting install (fail closed)"
+        rm -f "$verified_idx"
+        cat > "$STATUS_FILE" <<EOF
+{"status":"failed","version":"$installed","timestamp":"$(date -Iseconds 2>/dev/null || date)"}
+EOF
+        return 2
+    fi
+
+    # 2. Read Filename + SHA256 for the core package from the VERIFIED index.
+    local ipk_filename=$(awk -v pkg="$PKG_NAME" '/^Package: /{found=($2==pkg); next} found && /^Filename: /{print $2; exit} found && /^$/{exit}' "$verified_idx" 2>/dev/null)
+    local ipk_sha=$(opkg_index_sha256 "$verified_idx" "$PKG_NAME")
+    rm -f "$verified_idx"
+
+    if [ -z "$ipk_filename" ]; then
+        log "ERROR: $PKG_NAME not found in verified feed index — aborting (fail closed)"
+        cat > "$STATUS_FILE" <<EOF
+{"status":"failed","version":"$installed","timestamp":"$(date -Iseconds 2>/dev/null || date)"}
+EOF
+        return 2
+    fi
+
+    local cache_bust="t=$(date +%s)"
+    local ipk_url="$feed_url/$ipk_filename?$cache_bust"
+    local ipk_path="/tmp/$ipk_filename"
+
+    log "Downloading $ipk_filename from feed..."
+    if ! download "$ipk_url" "$ipk_path"; then
+        log "ERROR: Failed to download $ipk_url (fail closed)"
+        cat > "$STATUS_FILE" <<EOF
+{"status":"failed","version":"$installed","timestamp":"$(date -Iseconds 2>/dev/null || date)"}
+EOF
+        return 2
+    fi
+
+    # 3. Pin the .ipk by the SHA256 from the VERIFIED index. Mismatch => abort.
+    if ! opkg_verify_file_sha256 "$ipk_path" "$ipk_sha"; then
+        log "ERROR: downloaded $ipk_filename failed integrity check — aborting install (fail closed)"
+        rm -f "$ipk_path"
+        cat > "$STATUS_FILE" <<EOF
+{"status":"failed","version":"$installed","timestamp":"$(date -Iseconds 2>/dev/null || date)"}
+EOF
+        return 2
+    fi
+
+    # 4. Only now install the verified local file.
+    log "Installing verified $ipk_path via opkg install..."
+    local install_rc=0
+    opkg install "$ipk_path" 2>&1 | while read -r line; do log "opkg: $line"; done || install_rc=$?
+    rm -f "$ipk_path"
 
     local new_version=$(get_installed_version)
     if [ "$new_version" != "$installed" ]; then
-        log "Core update successful via opkg upgrade: $installed -> $new_version"
-        # Upgrade companion packages if installed
+        log "Core update successful: $installed -> $new_version"
         log "Checking companion packages..."
         upgrade_companion "luci-app-ctrl-modem"
         cat > "$STATUS_FILE" <<EOF
@@ -745,7 +1041,7 @@ EOF
         return 0
     fi
 
-    log "ERROR: Update failed (version still $installed)"
+    log "ERROR: Update failed (opkg install rc=$install_rc, version still $installed)"
     cat > "$STATUS_FILE" <<EOF
 {"status":"failed","version":"$installed","timestamp":"$(date -Iseconds 2>/dev/null || date)"}
 EOF
