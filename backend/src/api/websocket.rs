@@ -390,9 +390,7 @@ pub fn spawn_cache_refresh_task(state: Arc<AppState>) {
                     (Ok(signal), Ok(connection), Ok(registration)) => {
                         modem_failures.insert(modem_id.clone(), 0);
 
-                        let signal_strength =
-                            ((signal.rssi + 113.0) * 100.0 / 62.0).clamp(0.0, 100.0)
-                                as i32;
+                        let signal_strength = signal.signal_strength_percent();
 
                         let cache = ModemStateCache {
                             signal: signal.clone(),
@@ -1101,6 +1099,8 @@ pub fn spawn_wan_watchdog(state: Arc<AppState>) {
                                 restart_count: 0,
                                 restart_suspended: false,
                                 healthy_since: None,
+                                wedged: false,
+                                wedged_since: None,
                             });
                         info.has_sim = Some(result);
                     }
@@ -1135,6 +1135,8 @@ pub fn spawn_wan_watchdog(state: Arc<AppState>) {
                             restart_count: 0,
                             restart_suspended: false,
                             healthy_since: None,
+                            wedged: false,
+                            wedged_since: None,
                         });
                     info.status = WanModemStatus::NoSim;
                     info.consecutive_failures = 0;
@@ -1165,6 +1167,8 @@ pub fn spawn_wan_watchdog(state: Arc<AppState>) {
                         restart_count: 0,
                         restart_suspended: false,
                         healthy_since: None,
+                        wedged: false,
+                        wedged_since: None,
                     });
 
                 if result.overall_ok {
@@ -1178,6 +1182,12 @@ pub fn spawn_wan_watchdog(state: Arc<AppState>) {
                     info.consecutive_failures = 0;
                     if info.healthy_since.is_none() {
                         info.healthy_since = Some(tokio::time::Instant::now());
+                    }
+                    // BH-08: data path recovered — clear the wedge so a future wedge
+                    // re-alerts (re-arms the one-shot) and the grace window restarts.
+                    if info.wedged {
+                        info.wedged = false;
+                        info.wedged_since = None;
                     }
                 } else {
                     info.consecutive_failures += 1;
@@ -1549,6 +1559,13 @@ pub fn spawn_wan_watchdog(state: Arc<AppState>) {
                                 modem.label, max_attempts
                             ), "wan");
                         }
+
+                        // ── BH-08: persistent WDS-wedge detection + guarded reboot ──
+                        // Runs every cycle while this modem stays restart-suspended,
+                        // so the reboot can be (re-)evaluated once the grace window
+                        // elapses. Mode-agnostic: no QMI/uqmi, no `if modem == X`.
+                        evaluate_wedge_recovery(&state, modem, &watchdog, failure_threshold).await;
+
                         continue;
                     }
 
@@ -1894,7 +1911,8 @@ fn parse_first_inet_addr(output: &str) -> Option<String> {
 /// the specific modem, not through other WAN connections:
 /// - Ping: `-I {device}` binds ICMP to the interface
 /// - DNS: hostname ping via `-I {device}` tests resolution + interface reachability
-/// - HTTP: `wget --bind-address={ip}` forces source-IP binding
+/// - HTTP: in-process TCP connect with `SO_BINDTODEVICE` egress-bound to
+///   `{device}` (Linux), then a minimal HTTP/1.1 GET — see `http_probe`
 ///
 /// If the interface has no IP address (no SIM, no DHCP lease), all checks
 /// immediately fail without sending any traffic.
@@ -1937,7 +1955,11 @@ async fn run_health_check(
             overall_ok: false,
         };
     }
-    let ip = ip_addr.unwrap_or_default();
+    // The interface IP is no longer needed past the no-IP guard: the HTTP probe
+    // egress-binds by DEVICE (`SO_BINDTODEVICE`), which is stronger than binding
+    // a source IP and lets the kernel pick the correct source under policy
+    // routing. `_ip_addr` is retained only to document the guard above.
+    let _ip_addr = ip_addr;
 
     // Step 1: Ping (interface-bound via -I)
     let ping_ok = if is_mock {
@@ -1982,52 +2004,26 @@ async fn run_health_check(
     };
     let dns_ok = dns_v4_ok || dns_v6_ok;
 
-    // Step 3: HTTP — interface-bound check.
-    // Prefers `curl --interface {device}` (true SO_BINDTODEVICE socket binding).
-    // Falls back to `wget --bind-address={ip}` which only sets source IP but does
-    // NOT control routing — gated behind ping/DNS to prevent false positives on
-    // multi-WAN systems where traffic routes via the working modem.
+    // Step 3: HTTP — interface-bound check (in-process, no shell-out).
+    //
+    // The router userland is busybox (no curl), and neither busybox `wget`,
+    // `uclient-fetch`, nor busybox `nc` supports source-binding (`--interface`
+    // / `--bind-address` / `-s`). With source-IP policy routing in effect
+    // (`ip rule from <wan-ip> lookup N`) an UNBOUND request always egresses the
+    // box default WAN and would falsely attribute that WAN's reachability to a
+    // secondary interface. So correct per-interface attribution REQUIRES true
+    // egress binding, which we get with `SO_BINDTODEVICE` on the TCP socket
+    // (Linux-only). `http_target` is plain HTTP (port 80, no TLS).
     let http_ok = if is_mock {
         true
     } else {
-        // Try curl first (proper interface binding via SO_BINDTODEVICE).
-        // argv form — device + http_target validated at the WAN-config boundary.
-        let curl_result = tokio::process::Command::new("curl")
-            .args([
-                "--interface", device,
-                "-s", "-o", "/dev/null", "-m", "5",
-                "-w", "%{http_code}",
-                http_target,
-            ])
-            .output()
-            .await;
-
-        match curl_result {
-            Ok(output) if output.status.code() != Some(127) => {
-                // curl exists — check if HTTP succeeded (2xx/3xx status)
-                let code = String::from_utf8_lossy(&output.stdout);
-                let status: u16 = code.trim().trim_matches('\'').parse().unwrap_or(0);
-                (200..400).contains(&status)
+        // `http_target` is validated at the WAN-config boundary, but re-parse it
+        // in Rust here (no shell anywhere in this path).
+        match parse_http_target(http_target) {
+            Some((host, port, path)) => {
+                http_probe(device, &host, port, &path).await.unwrap_or(false)
             }
-            _ => {
-                // curl not available — fall back to wget, but only if ping or DNS
-                // passed (wget --bind-address can't properly interface-bind)
-                if !ping_ok && !dns_ok {
-                    false
-                } else {
-                    // argv form — ip is from `ip addr` (not user input),
-                    // http_target validated at the WAN-config boundary.
-                    match tokio::process::Command::new("wget")
-                        .arg(format!("--bind-address={ip}"))
-                        .args(["-q", "-O", "/dev/null", "-T", "5", http_target])
-                        .output()
-                        .await
-                    {
-                        Ok(output) => output.status.success(),
-                        Err(_) => false,
-                    }
-                }
-            }
+            None => false,
         }
     };
 
@@ -2042,6 +2038,226 @@ async fn run_health_check(
         http_ok,
         overall_ok,
     }
+}
+
+/// Overall budget for the interface-bound HTTP probe (DNS + connect + request +
+/// status line). Stays inside the existing ~5s HTTP step budget.
+///
+/// Only consumed by the Linux `http_probe`; off-Linux the probe is a stub, so
+/// silence dead-code there (the `tests` module still exercises siblings).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const HTTP_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Parse a plain-HTTP probe target into `(host, port, path)`.
+///
+/// Pure Rust — no shell. Only `http://` (port 80 default) is accepted; the WAN
+/// health probe target is plain HTTP by design (`generate_204`, no TLS), so an
+/// `https://` target is rejected here rather than silently mis-probed. The path
+/// defaults to `/` when absent and always includes any `?query`. Returns `None`
+/// for anything malformed.
+fn parse_http_target(target: &str) -> Option<(String, u16, String)> {
+    if target.is_empty() || target.len() > 512 {
+        return None;
+    }
+    // Reject whitespace / control characters defensively (the value is validated
+    // at the WAN-config boundary, but this path must never trust it blindly).
+    if target.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return None;
+    }
+
+    let rest = target.strip_prefix("http://")?;
+    if rest.is_empty() {
+        return None;
+    }
+
+    // Split authority from path: the first '/' after the authority starts the
+    // path. A '?' (query without an explicit path) also terminates authority.
+    let (authority, path) = match rest.find(['/', '?']) {
+        Some(idx) => {
+            let (a, p) = rest.split_at(idx);
+            (a, p.to_string())
+        }
+        None => (rest, "/".to_string()),
+    };
+    // If the path part started with '?', prepend '/' so the request line is valid.
+    let path = if path.starts_with('?') {
+        format!("/{path}")
+    } else if path.is_empty() {
+        "/".to_string()
+    } else {
+        path
+    };
+
+    // Strip optional userinfo (`user@host`) — not expected for the probe target,
+    // but parse it out rather than treating it as part of the host.
+    let host_port = match authority.rsplit_once('@') {
+        Some((_userinfo, hp)) => hp,
+        None => authority,
+    };
+    if host_port.is_empty() {
+        return None;
+    }
+
+    // Split host:port. Bracketed IPv6 literals are not expected for this probe;
+    // a bare ':' splits host from an optional numeric port.
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((h, p)) => {
+            let parsed: u16 = p.parse().ok()?;
+            if parsed == 0 {
+                return None;
+            }
+            (h, parsed)
+        }
+        None => (host_port, 80u16),
+    };
+    if host.is_empty() {
+        return None;
+    }
+
+    Some((host.to_string(), port, path))
+}
+
+/// True iff `line` is a well-formed HTTP status line whose code is 2xx or 3xx.
+///
+/// Accepts `HTTP/1.0 204 No Content`, `HTTP/1.1 200 OK`, etc. A 4xx/5xx code,
+/// a missing/garbage code, or a non-`HTTP/` start line all return false.
+///
+/// Called by the Linux `http_probe` and by the cross-platform unit tests; the
+/// off-Linux build path has no non-test caller, so allow dead_code there.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn http_status_is_success(line: &str) -> bool {
+    let line = line.trim_start();
+    if !line.starts_with("HTTP/") {
+        return false;
+    }
+    let mut parts = line.split_whitespace();
+    let _version = parts.next();
+    match parts.next().and_then(|c| c.parse::<u16>().ok()) {
+        Some(code) => (200..400).contains(&code),
+        None => false,
+    }
+}
+
+/// Perform an interface-bound plain-HTTP probe to `host:port{path}` via `device`.
+///
+/// On Linux the TCP socket is bound to `device` with `SO_BINDTODEVICE` so the
+/// request egresses through THAT WAN interface even under source-IP policy
+/// routing — this is what gives correct per-interface attribution (a healthy
+/// secondary WAN is tested through itself, never the box default WAN). DNS
+/// resolution uses the system resolver (`lookup_host`); DNS reachability is
+/// validated separately by the dns step, so we only need an address to connect
+/// the bound socket to. Returns `Ok(true)` on a 2xx/3xx status line.
+///
+/// `SO_BINDTODEVICE` is Linux-only; on other targets this is a compile stub that
+/// always reports `Ok(false)` (production runs on Linux; local dev runs under the
+/// `is_mock` short-circuit and never reaches this path).
+#[cfg(target_os = "linux")]
+async fn http_probe(device: &str, host: &str, port: u16, path: &str) -> std::io::Result<bool> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let result = tokio::time::timeout(HTTP_PROBE_TIMEOUT, async move {
+        // Resolve host -> address(es) via the system resolver. Prefer IPv4 to
+        // match the plain-HTTP probe target; fall back to any resolved address.
+        let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
+        let addr = addrs
+            .iter()
+            .find(|a| a.is_ipv4())
+            .or_else(|| addrs.first())
+            .copied()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "no address resolved")
+            })?;
+
+        // Build a non-blocking TCP socket bound to the WAN device.
+        let domain = if addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+        socket.bind_device(Some(device.as_bytes()))?;
+        socket.set_nonblocking(true)?;
+
+        // Initiate the connect on the device-bound non-blocking socket. A
+        // non-blocking connect does not complete synchronously: on Linux it
+        // returns EINPROGRESS (raw os error 115; some std versions surface it as
+        // WouldBlock), which we tolerate and let tokio's writability readiness
+        // finish below. Any other error (e.g. EHOSTUNREACH if the device has no
+        // route) is a real failure.
+        match socket.connect(&addr.into()) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(115) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e),
+        }
+
+        // Hand the in-progress socket to tokio. socket2 -> std -> tokio TcpStream.
+        let std_stream: std::net::TcpStream = socket.into();
+        let stream = tokio::net::TcpStream::from_std(std_stream)?;
+        // Writability readiness fires when the non-blocking connect completes
+        // (success OR failure).
+        stream.writable().await?;
+        // Surface a failed connect (connection refused / host unreachable).
+        if let Some(err) = stream.take_error()? {
+            return Err(err);
+        }
+        // Now that the connect has completed, peer_addr() succeeds — confirms we
+        // are actually connected rather than ENOTCONN on an unconnected socket.
+        stream.peer_addr()?;
+
+        let mut stream = stream;
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: ctrl-modem-wan-probe/1\r\nConnection: close\r\nAccept: */*\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+        stream.flush().await?;
+
+        // Read just enough to capture the status line.
+        let mut buf = [0u8; 256];
+        let mut collected: Vec<u8> = Vec::with_capacity(256);
+        loop {
+            let n = stream.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            collected.extend_from_slice(&buf[..n]);
+            if let Some(pos) = collected.windows(2).position(|w| w == b"\r\n") {
+                let line = String::from_utf8_lossy(&collected[..pos]);
+                return Ok(http_status_is_success(&line));
+            }
+            // Bound the read so a misbehaving peer can't make us loop forever.
+            if collected.len() > 8192 {
+                break;
+            }
+        }
+        // Connection closed (or capped) without a complete status line.
+        let line = String::from_utf8_lossy(&collected);
+        Ok(http_status_is_success(line.lines().next().unwrap_or("")))
+    })
+    .await;
+
+    match result {
+        Ok(inner) => inner,
+        // Timed out within the budget — treat as a failed probe, not an error.
+        Err(_elapsed) => Ok(false),
+    }
+}
+
+/// Non-Linux compile stub: `SO_BINDTODEVICE` (`Socket::bind_device`) does not
+/// exist off Linux, and per-interface egress binding is meaningless on dev hosts.
+/// Production always runs on Linux; local dev/preflight runs under the `is_mock`
+/// short-circuit and never reaches this path. Reports `Ok(false)` so the http
+/// step is simply inert (overall_ok still derives from ping/dns).
+#[cfg(not(target_os = "linux"))]
+async fn http_probe(
+    _device: &str,
+    _host: &str,
+    _port: u16,
+    _path: &str,
+) -> std::io::Result<bool> {
+    Ok(false)
 }
 
 /// UCI helper: set metric (called from watchdog context).
@@ -2139,6 +2355,7 @@ async fn build_wan_status(state: &AppState) -> WanStatusResponse {
                 imei: None,
                 restart_suspended: runtime_info.map(|r| r.restart_suspended).unwrap_or(false),
                 restart_count: runtime_info.map(|r| r.restart_count).unwrap_or(0),
+                wedged: runtime_info.map(|r| r.wedged).unwrap_or(false),
                 weight: entry.weight,
                 proto_override: entry.proto_override.clone(),
                 // Diagnostic only — Ethernet entries have no modem to query.
@@ -2236,6 +2453,315 @@ fn should_fast_fail(
         && consecutive_failures >= failure_threshold
 }
 
+/// Classify a persistent WDS-wedge from existing watchdog state (mode-agnostic).
+/// True only when normal restart recovery is exhausted (`restart_suspended`) AND the
+/// radio is healthy (`registered_with_signal`) AND probe failures prove the bearer is
+/// dead (`consecutive_failures >= failure_threshold`). Pure; unit-testable.
+///
+/// BH-08 fix (2026-06-25): the wedge predicate does NOT consider `has_current_ip`. On
+/// the real RM520N-GL qmi wedge the modem retains a stale IP (`valid_lft forever` +
+/// stale route), so requiring `!has_current_ip` defeated detection. A retained-but-dead
+/// IP is part of the wedge signature, not evidence of health — the dead data path is
+/// already proven by `restart_suspended` + radio-healthy + the failure threshold. The
+/// `!has_current_ip` term remains correct in `should_fast_fail` (DHCP starvation, a
+/// different concern) and is left unchanged there.
+fn classify_wedge(
+    restart_suspended: bool,
+    registered_with_signal: bool,
+    consecutive_failures: u32,
+    failure_threshold: u32,
+) -> bool {
+    restart_suspended && registered_with_signal && consecutive_failures >= failure_threshold
+}
+
+/// Pure "radio healthy" predicate for wedge classification (BH-08 fix, 2026-06-25).
+///
+/// The radio is healthy (registered-with-signal) when the modem is clearly attached to
+/// a network: a non-zero `signal_strength` AND at least one positive registration cue —
+/// the cache says `registered`, OR it reports a live operator, OR it reports a radio
+/// technology. The original predicate required strictly `registration == Registered`,
+/// which the RM520N-GL qmi 60 s master cache never sets even while `operator`,
+/// `technology`, and `signal_strength` are all populated (defect B).
+///
+/// False-positive guard: `signal_strength > 0` is the discriminator that keeps a real
+/// no-signal outage (signal drops to 0, operator clears) from classifying as healthy —
+/// do NOT weaken it.
+fn radio_healthy(
+    signal_strength: i32,
+    registered: bool,
+    has_operator: bool,
+    has_technology: bool,
+) -> bool {
+    signal_strength > 0 && (registered || has_operator || has_technology)
+}
+
+/// All gates that must hold for the opt-in guarded reboot to fire. Pure.
+fn should_wedge_reboot(
+    reboot_enabled: bool,
+    is_wedged: bool,
+    is_sole_live_uplink: bool,   // no OTHER WAN online/overall_ok
+    grace_elapsed: bool,         // wedged_since age >= grace_mins
+    uptime_ok: bool,             // router uptime >= min_uptime_mins
+    under_daily_cap: bool,       // ledger.count_since(now,24h) < max_per_day
+) -> bool {
+    reboot_enabled && is_wedged && is_sole_live_uplink && grace_elapsed && uptime_ok && under_daily_cap
+}
+
+/// Emit a one-shot WDS-wedge alert: broadcasts the `ModemWanWedged` WS event,
+/// writes an audit log entry, and appends a watchdog log line. Called exactly
+/// once per wedge transition (wired in Task 7). Mode-agnostic — no QMI/uqmi
+/// references; caller supplies label from the WAN config entry.
+async fn emit_wedge_alert(state: &Arc<AppState>, modem_id: &str, label: &str, restart_count: u32) {
+    let message = format!(
+        "WAN wedged: {label} registered but data path unrecoverable after {restart_count} restarts — reboot required"
+    );
+    state.broadcast_modem_event(
+        modem_id,
+        crate::hardware::ModemEvent::ModemWanWedged {
+            modem_id: modem_id.to_string(),
+            label: label.to_string(),
+            restart_count,
+            message: message.clone(),
+        },
+    );
+    state.audit.log(
+        crate::security::audit::AuditEventType::ConfigChanged,
+        None,
+        format!("WAN wedge detected: {message}"),
+    ).await;
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let _ = crate::config::wan::append_watchdog_log(
+        &format!("{timestamp} WEDGE_DETECTED modem=\"{label}\" restart_count={restart_count}"),
+    ).await;
+}
+
+/// Mode-agnostic "radio healthy" reader for wedge classification: reads the modem's
+/// 60 s master cache (same source the dashboard reads) and delegates the decision to the
+/// pure [`radio_healthy`] predicate. Does NOT issue any AT/QMI call. False if the modem
+/// is unknown or its cache has not yet populated.
+async fn registered_with_signal(state: &Arc<AppState>, modem_id: &str) -> bool {
+    let modems = state.modems.read().await;
+    let Some(ctx) = modems.get(modem_id) else {
+        return false;
+    };
+    let cache = ctx.state_cache.read().await;
+    let Some(snapshot) = cache.as_ref() else {
+        return false;
+    };
+    let registered = matches!(
+        snapshot.registration,
+        crate::hardware::RegistrationState::Registered { .. }
+    );
+    radio_healthy(
+        snapshot.signal_strength,
+        registered,
+        snapshot.connection.operator.is_some(),
+        snapshot.connection.technology.is_some(),
+    )
+}
+
+/// Parse the first whitespace-delimited float from `/proc/uptime` into whole seconds.
+/// Pure; unit-tested.
+fn parse_proc_uptime(contents: &str) -> Option<u64> {
+    contents
+        .split_whitespace()
+        .next()?
+        .parse::<f64>()
+        .ok()
+        .map(|f| f as u64)
+}
+
+/// Router uptime in seconds, read from `/proc/uptime`. Returns 0 if unreadable
+/// (which trips the min-uptime gate closed — the boot-loop-safe direction).
+async fn router_uptime_secs() -> u64 {
+    tokio::fs::read_to_string("/proc/uptime")
+        .await
+        .ok()
+        .and_then(|c| parse_proc_uptime(&c))
+        .unwrap_or(0)
+}
+
+/// True when NO WAN entry OTHER than `this_modem_id` is currently Online — i.e. the
+/// wedged modem is the sole live uplink. Ethernet entries are health-checked into the
+/// same `modem_statuses` map, so this covers eth/other WAN health automatically.
+async fn is_sole_live_uplink(state: &Arc<AppState>, this_modem_id: &str) -> bool {
+    let runtime = state.wan_runtime.read().await;
+    !runtime
+        .modem_statuses
+        .iter()
+        .any(|(id, info)| id != this_modem_id && info.status == WanModemStatus::Online)
+}
+
+/// BH-08: evaluate the persistent WDS-wedge for a restart-suspended modem and, if
+/// classified wedged, raise a one-shot alert (always-on) and — only when the operator
+/// has opted in AND all six gates hold — fire a guarded controlled reboot. Degrade-safe:
+/// any ledger read/write failure SKIPS the reboot (never reboot untracked). Runs every
+/// watchdog cycle while the modem stays suspended. Mode-agnostic.
+async fn evaluate_wedge_recovery(
+    state: &Arc<AppState>,
+    modem: &crate::hardware::WanModemEntry,
+    watchdog: &crate::hardware::WatchdogConfig,
+    failure_threshold: u32,
+) {
+    // ── Classify (all inputs from existing daemon state — no AT/QMI call) ──
+    // BH-08 fix (2026-06-25): a stale-but-dead IP is part of the wedge signature, so
+    // `classify_wedge` no longer reads `has_current_ip` — the dead bearer is proven by
+    // `restart_suspended` + radio-healthy + `consecutive_failures >= failure_threshold`.
+    let registered = registered_with_signal(state, &modem.modem_id).await;
+    let (consecutive_failures, prev_wedged, restart_count) = {
+        let runtime = state.wan_runtime.read().await;
+        runtime
+            .modem_statuses
+            .get(&modem.modem_id)
+            .map(|i| (i.consecutive_failures, i.wedged, i.restart_count))
+            .unwrap_or((0, false, 0))
+    };
+
+    let is_wedged = classify_wedge(
+        true, // restart_suspended — guaranteed by the caller's branch
+        registered,
+        consecutive_failures,
+        failure_threshold,
+    );
+
+    if !is_wedged {
+        return;
+    }
+
+    // ── One-shot alert on the wedge transition (guard on prior flag) ──
+    if !prev_wedged {
+        {
+            let mut runtime = state.wan_runtime.write().await;
+            if let Some(info) = runtime.modem_statuses.get_mut(&modem.modem_id) {
+                // `wedged_since` is stamped NOW on the transition cycle, so
+                // `grace_elapsed` is never true on this same cycle — a reboot
+                // can only fire on a later cycle once the grace window elapses.
+                // Do not "optimise" this by pre-dating `wedged_since`.
+                info.wedged = true;
+                info.wedged_since = Some(tokio::time::Instant::now());
+            }
+        }
+        emit_wedge_alert(state, &modem.modem_id, &modem.label, restart_count).await;
+    }
+
+    // ── Guarded reboot evaluation (opt-in) ──
+    if !watchdog.wedge_reboot_enabled {
+        return;
+    }
+
+    let grace_elapsed = {
+        let runtime = state.wan_runtime.read().await;
+        runtime
+            .modem_statuses
+            .get(&modem.modem_id)
+            .and_then(|i| i.wedged_since)
+            .map(|t| t.elapsed().as_secs() >= (watchdog.wedge_reboot_grace_mins as u64) * 60)
+            .unwrap_or(false)
+    };
+    let sole_uplink = is_sole_live_uplink(state, &modem.modem_id).await;
+    let uptime_ok =
+        router_uptime_secs().await >= (watchdog.wedge_reboot_min_uptime_mins as u64) * 60;
+
+    let now = chrono::Utc::now().timestamp();
+    // Degrade-safe: a corrupt/unreadable ledger means we cannot guarantee the
+    // anti-boot-loop ceiling — SKIP the reboot rather than reboot untracked.
+    let ledger = match crate::config::wedge_reboot::load_ledger().await {
+        Ok(l) => l.pruned(now, crate::config::wedge_reboot::WINDOW_SECS),
+        Err(e) => {
+            crate::state::debug_trace_with_source(
+                format!("[WAN] {} wedge reboot SKIPPED — ledger unreadable: {e}", modem.label),
+                "wan",
+            );
+            return;
+        }
+    };
+    let under_daily_cap = ledger.count_since(now, crate::config::wedge_reboot::WINDOW_SECS)
+        < watchdog.wedge_reboot_max_per_day as usize;
+
+    if should_wedge_reboot(
+        watchdog.wedge_reboot_enabled,
+        is_wedged,
+        sole_uplink,
+        grace_elapsed,
+        uptime_ok,
+        under_daily_cap,
+    ) {
+        // Record to the ledger FIRST and persist it; only reboot if the entry
+        // survives. A save failure SKIPS the reboot (never reboot unrecorded).
+        let recorded = ledger.with_recorded(now, &modem.modem_id, "wds-wedge");
+        if let Err(e) = crate::config::wedge_reboot::save_ledger(&recorded).await {
+            crate::state::debug_trace_with_source(
+                format!("[WAN] {} wedge reboot SKIPPED — ledger save failed: {e}", modem.label),
+                "wan",
+            );
+            return;
+        }
+        let attempt = recorded.count_since(now, crate::config::wedge_reboot::WINDOW_SECS);
+        let max = watchdog.wedge_reboot_max_per_day;
+
+        state.audit.log(
+            crate::security::audit::AuditEventType::ConfigChanged,
+            None,
+            format!(
+                "WAN wedge auto-reboot: {} sole-uplink, attempt {attempt}/{max}",
+                modem.label
+            ),
+        ).await;
+
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let _ = crate::config::wan::append_watchdog_log(&format!(
+            "{timestamp} WEDGE_REBOOT modem=\"{}\" count={attempt}/{max}",
+            modem.label
+        )).await;
+
+        let reboot_msg = format!(
+            "WAN wedged: {} is the sole live uplink — controlled reboot {attempt}/{max} to recover",
+            modem.label
+        );
+        state.broadcast_modem_event(
+            &modem.modem_id,
+            crate::hardware::ModemEvent::ModemWanWedged {
+                modem_id: modem.modem_id.clone(),
+                label: modem.label.clone(),
+                restart_count,
+                message: reboot_msg,
+            },
+        );
+
+        // Reuse the watchdog's process shell-out style (cf. ifup/ifdown).
+        let _ = tokio::process::Command::new("reboot").output().await;
+    } else if !under_daily_cap && !prev_wedged {
+        // Over the daily ceiling: escalate exactly ONCE per wedge instance, gated on
+        // the same `!prev_wedged` one-shot as the detection alert. Each prior
+        // auto-reboot rebooted the router (re-arming `wedged=false`), so a post-boot
+        // re-wedge while already at the cap surfaces here on its transition.
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let actual_count = ledger.count_since(now, crate::config::wedge_reboot::WINDOW_SECS);
+        let escalation = format!(
+            "WAN wedge {} — boot-loop suspected ({}/{} auto-reboots in 24h): manual intervention required",
+            modem.label, actual_count, watchdog.wedge_reboot_max_per_day
+        );
+        state.audit.log(
+            crate::security::audit::AuditEventType::ConfigChanged,
+            None,
+            escalation.clone(),
+        ).await;
+        let _ = crate::config::wan::append_watchdog_log(&format!(
+            "{timestamp} WEDGE_REBOOT_SUPPRESSED modem=\"{}\" reason=\"boot-loop ceiling reached\"",
+            modem.label
+        )).await;
+        state.broadcast_modem_event(
+            &modem.modem_id,
+            crate::hardware::ModemEvent::ModemWanWedged {
+                modem_id: modem.modem_id.clone(),
+                label: modem.label.clone(),
+                restart_count,
+                message: escalation,
+            },
+        );
+    }
+}
+
 /// Compute the desired primary WAN: the highest-priority entry that is Online.
 /// Walks the full modem_priority list (active + standby) in config order.
 /// Returns None if no WAN is healthy (caller should leave routing unchanged).
@@ -2253,6 +2779,122 @@ fn compute_desired_primary(
             None
         }
     })
+}
+
+#[cfg(test)]
+mod classify_wedge_tests {
+    use super::*;
+    #[test]
+    fn wedge_true_when_exhausted_registered_and_data_down() {
+        assert!(classify_wedge(true, true, 5, 3));
+    }
+    #[test]
+    fn no_wedge_when_radio_down() {
+        // genuine no-signal outage, not a wedge
+        assert!(!classify_wedge(true, false, 5, 3));
+    }
+    #[test]
+    fn no_wedge_before_restarts_exhausted() {
+        assert!(!classify_wedge(false, true, 5, 3));
+    }
+    #[test]
+    fn no_wedge_below_failure_threshold() {
+        assert!(!classify_wedge(true, true, 2, 3));
+    }
+
+    // BH-08 fix (2026-06-25): the real RM520N-GL qmi wedge retains a stale IP
+    // (`has_current_ip == true`). That must NOT defeat detection — `classify_wedge`
+    // no longer reads `has_current_ip`. With radio healthy + restart_suspended +
+    // failures past threshold, the verdict is wedged regardless of any retained IP.
+    #[test]
+    fn wedge_true_even_with_stale_ip_retained() {
+        // Bug case: exhausted + radio-healthy + failures>=threshold ⇒ wedged.
+        // (A stale IP would previously have flipped this to NOT-wedged.)
+        assert!(classify_wedge(true, true, 5, 3));
+    }
+    #[test]
+    fn no_wedge_when_not_suspended_even_with_stale_ip() {
+        // Not restart-suspended ⇒ normal recovery still in play, never a wedge.
+        assert!(!classify_wedge(false, true, 5, 3));
+    }
+    #[test]
+    fn no_wedge_when_radio_unhealthy_even_with_stale_ip() {
+        // Radio not healthy (no-signal outage) ⇒ not a wedge, regardless of IP.
+        assert!(!classify_wedge(true, false, 5, 3));
+    }
+}
+
+#[cfg(test)]
+mod radio_healthy_tests {
+    use super::*;
+
+    // BH-08 bug case (2026-06-25): RM520N-GL qmi cache reports operator + non-zero
+    // signal but registration is NOT `Registered` (e.g. `Searching`). The radio IS
+    // healthy — it is clearly attached to a network.
+    #[test]
+    fn healthy_when_operator_present_signal_nonzero_not_registered() {
+        // registered=false, operator present, signal 49 (the bench reading).
+        assert!(radio_healthy(49, false, true, false));
+    }
+
+    #[test]
+    fn healthy_when_technology_present_signal_nonzero_not_registered() {
+        assert!(radio_healthy(50, false, false, true));
+    }
+
+    #[test]
+    fn healthy_when_strictly_registered_signal_nonzero() {
+        assert!(radio_healthy(48, true, false, false));
+    }
+
+    // False-positive guard: a real no-signal outage drops signal to 0 ⇒ NOT healthy,
+    // even if a stale operator/technology string lingers in the cache.
+    #[test]
+    fn not_healthy_when_signal_zero_even_with_operator() {
+        assert!(!radio_healthy(0, false, true, true));
+    }
+
+    #[test]
+    fn not_healthy_when_signal_zero_even_when_registered() {
+        assert!(!radio_healthy(0, true, true, true));
+    }
+
+    // No positive registration cue at all ⇒ NOT healthy (not attached to a network),
+    // even with a non-zero signal floor.
+    #[test]
+    fn not_healthy_when_no_registration_cue() {
+        assert!(!radio_healthy(40, false, false, false));
+    }
+}
+
+#[cfg(test)]
+mod parse_proc_uptime_tests {
+    use super::*;
+    #[test]
+    fn parse_proc_uptime_reads_first_float() {
+        assert_eq!(parse_proc_uptime("12345.67 9999.00\n"), Some(12345));
+        assert_eq!(parse_proc_uptime("garbage"), None);
+    }
+    #[test]
+    fn parse_proc_uptime_handles_empty() {
+        assert_eq!(parse_proc_uptime(""), None);
+        assert_eq!(parse_proc_uptime("   \n"), None);
+    }
+}
+
+#[cfg(test)]
+mod should_wedge_reboot_tests {
+    use super::*;
+    fn all_true() -> [bool; 6] { [true; 6] }
+    fn call(b: [bool; 6]) -> bool { should_wedge_reboot(b[0], b[1], b[2], b[3], b[4], b[5]) }
+
+    #[test] fn fires_when_all_gates_true() { assert!(call(all_true())); }
+    #[test] fn blocked_when_disabled() { let mut b = all_true(); b[0] = false; assert!(!call(b)); }
+    #[test] fn blocked_when_not_wedged() { let mut b = all_true(); b[1] = false; assert!(!call(b)); }
+    #[test] fn blocked_when_other_wan_healthy() { let mut b = all_true(); b[2] = false; assert!(!call(b)); }
+    #[test] fn blocked_before_grace() { let mut b = all_true(); b[3] = false; assert!(!call(b)); }
+    #[test] fn blocked_when_uptime_too_low() { let mut b = all_true(); b[4] = false; assert!(!call(b)); }
+    #[test] fn blocked_when_over_daily_cap() { let mut b = all_true(); b[5] = false; assert!(!call(b)); }
 }
 
 #[cfg(test)]
@@ -2350,6 +2992,104 @@ mod tests {
         assert!(src.contains(&format!("Command::new({}ifup{})", '"', '"')));
         assert!(src.contains(&format!("Command::new({}ip{})", '"', '"')));
     }
+
+    // ========================================================================
+    // FIX (BH-05): in-process, interface-bound WAN HTTP probe.
+    // The curl/wget shell-out is gone; http_ok now comes from an SO_BINDTODEVICE
+    // socket. These tests cover the cross-platform pieces (URL + status parse).
+    // Socket binding itself is Linux-only and exercised on hardware, not here.
+    // ========================================================================
+
+    #[test]
+    fn http_status_success_accepts_2xx_and_3xx() {
+        assert!(super::http_status_is_success("HTTP/1.1 200 OK"));
+        assert!(super::http_status_is_success("HTTP/1.0 204 No Content"));
+        assert!(super::http_status_is_success("HTTP/1.1 301 Moved Permanently"));
+        assert!(super::http_status_is_success("HTTP/1.1 399 Whatever"));
+        // Leading whitespace tolerated.
+        assert!(super::http_status_is_success("  HTTP/1.1 200 OK"));
+    }
+
+    #[test]
+    fn http_status_success_rejects_4xx_5xx_and_malformed() {
+        assert!(!super::http_status_is_success("HTTP/1.1 404 Not Found"));
+        assert!(!super::http_status_is_success("HTTP/1.1 500 Internal Server Error"));
+        assert!(!super::http_status_is_success("HTTP/1.1 199 Early"));
+        assert!(!super::http_status_is_success("HTTP/1.1 400 Bad Request"));
+        // Not an HTTP status line at all.
+        assert!(!super::http_status_is_success("GET / HTTP/1.1"));
+        assert!(!super::http_status_is_success("garbage"));
+        assert!(!super::http_status_is_success(""));
+        // Missing / non-numeric code.
+        assert!(!super::http_status_is_success("HTTP/1.1"));
+        assert!(!super::http_status_is_success("HTTP/1.1 OK 200"));
+    }
+
+    #[test]
+    fn parse_http_target_basic_host_default_port_and_path() {
+        let (host, port, path) =
+            super::parse_http_target("http://connectivitycheck.gstatic.com/generate_204").unwrap();
+        assert_eq!(host, "connectivitycheck.gstatic.com");
+        assert_eq!(port, 80);
+        assert_eq!(path, "/generate_204");
+    }
+
+    #[test]
+    fn parse_http_target_defaults_path_to_root() {
+        let (host, port, path) = super::parse_http_target("http://example.com").unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 80);
+        assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn parse_http_target_explicit_port() {
+        let (host, port, path) = super::parse_http_target("http://10.0.0.1:8080/health").unwrap();
+        assert_eq!(host, "10.0.0.1");
+        assert_eq!(port, 8080);
+        assert_eq!(path, "/health");
+    }
+
+    #[test]
+    fn parse_http_target_query_without_path_gets_root() {
+        let (host, port, path) = super::parse_http_target("http://example.com?x=1").unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 80);
+        assert_eq!(path, "/?x=1");
+    }
+
+    #[test]
+    fn parse_http_target_preserves_query_string() {
+        let (_, _, path) = super::parse_http_target("http://example.com/a?b=c&d=e").unwrap();
+        assert_eq!(path, "/a?b=c&d=e");
+    }
+
+    #[test]
+    fn parse_http_target_strips_userinfo() {
+        let (host, port, _) = super::parse_http_target("http://user@example.com:81/p").unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 81);
+    }
+
+    #[test]
+    fn parse_http_target_rejects_non_http_and_malformed() {
+        // https is intentionally rejected — the probe is plain HTTP.
+        assert!(super::parse_http_target("https://example.com/").is_none());
+        assert!(super::parse_http_target("ftp://example.com/").is_none());
+        assert!(super::parse_http_target("example.com/path").is_none());
+        assert!(super::parse_http_target("http://").is_none());
+        assert!(super::parse_http_target("http:///path").is_none());
+        assert!(super::parse_http_target("").is_none());
+        // Bad / zero port.
+        assert!(super::parse_http_target("http://example.com:0/").is_none());
+        assert!(super::parse_http_target("http://example.com:notaport/").is_none());
+        // Whitespace / control chars (defense in depth).
+        assert!(super::parse_http_target("http://exa mple.com/").is_none());
+        assert!(super::parse_http_target("http://example.com/\n").is_none());
+        // Over-length.
+        let long = format!("http://example.com/{}", "a".repeat(600));
+        assert!(super::parse_http_target(&long).is_none());
+    }
 }
 
 #[cfg(test)]
@@ -2390,6 +3130,8 @@ mod watchdog_tests {
             restart_count: 0,
             restart_suspended: false,
             healthy_since: since,
+            wedged: false,
+            wedged_since: None,
         }
     }
 
@@ -2403,6 +3145,8 @@ mod watchdog_tests {
             restart_count: 0,
             restart_suspended: false,
             healthy_since: None,
+            wedged: false,
+            wedged_since: None,
         }
     }
 

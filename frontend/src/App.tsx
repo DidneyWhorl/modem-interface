@@ -28,7 +28,7 @@ import { AgcccLogo } from '@/components/ui/AgcccLogo';
 import { ViewPresetBar } from '@/components/ui/ViewPresetBar';
 import { WanManagerPage } from '@/pages/WanManagerPage';
 import { powerDownModem, rebootModem, setAirplaneMode, getAirplaneMode } from '@/api/modem';
-import { getLicenseStatus } from '@/api/license';
+import { getLicenseDetail } from '@/api/license';
 import type { LicenseStatus } from '@/types/api';
 import { ActiveModemLabel } from '@/components/modem/ActiveModemLabel';
 import { WifiOff, Power, RotateCcw, Plane, Loader2, ChevronDown, LayoutGrid, Maximize2 } from 'lucide-react';
@@ -40,22 +40,25 @@ function App() {
 
   // License state is informational only — the license/portal is OPTIONAL and
   // never blocks the dashboard. Unlicensed is a normal, fully-usable state.
-  // We fetch the status purely so Settings can surface the device token and a
-  // "cloud features: active / not activated" affordance.
+  // We fetch the FULL detail (tier/expiry/device token) for the dashboard's
+  // profile display. Detail is authenticated (L-01), so we only fetch it once
+  // the session is established — the reduced public `/license/status` route
+  // stays for the unauth activation flow (LicenseSettings).
   const [licenseInfo, setLicenseInfo] = useState<LicenseStatus | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    getLicenseStatus()
-      .then((status) => { if (!cancelled) setLicenseInfo(status); })
-      .catch(() => { /* license is optional — ignore errors */ });
-    return () => { cancelled = true; };
-  }, []);
 
   // Authentication state
   const { state: authState, user, login, logout, setup } = useAuth();
   const location = useLocation();
   const navigate = useNavigate();
+
+  useEffect(() => {
+    if (authState !== 'authenticated') return;
+    let cancelled = false;
+    getLicenseDetail()
+      .then((status) => { if (!cancelled) setLicenseInfo(status); })
+      .catch(() => { /* license is optional — ignore errors */ });
+    return () => { cancelled = true; };
+  }, [authState]);
 
   // Loading state (auth only — license never gates the dashboard)
   if (authState === 'loading') {

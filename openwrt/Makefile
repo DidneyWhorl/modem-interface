@@ -1,13 +1,13 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=modem-interface
-PKG_VERSION:=1.4.1
+PKG_VERSION:=1.5.0
 PKG_RELEASE:=1
 
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
 PKG_SOURCE:=$(PKG_NAME)_$(PKG_VERSION)-$(PKG_RELEASE)_aarch64_cortex-a53.ipk
 PKG_SOURCE_URL:=https://packages.ctrl-modem.com/stable/feed/aarch64_cortex-a53/
-PKG_HASH:=694894a67205e71457b1236f20d3f57c55464ce4d760ccf47d8262003595858a
+PKG_HASH:=00744eaaf2c1d3ef603c437c55709e30b9b66460666a05e922bf00d629b0f1f0
 
 PKG_MAINTAINER:=agccc <agccc@netsolution.shop>
 PKG_LICENSE:=MIT
@@ -22,7 +22,7 @@ define Package/modem-interface
   CATEGORY:=Network
   TITLE:=CTRL-Modem — cellular modem management interface
   URL:=https://github.com/DidneyWhorl/modem-interface
-  DEPENDS:=+kmod-usb-serial +kmod-usb-serial-option +kmod-usb-serial-wwan +openssl-util +ca-bundle
+  DEPENDS:=+kmod-usb-serial +kmod-usb-serial-option +kmod-usb-serial-wwan +ca-bundle
 endef
 
 define Package/modem-interface/description

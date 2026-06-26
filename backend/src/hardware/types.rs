@@ -57,6 +57,13 @@ pub struct ModemStatus {
     pub ip_address: Option<String>,
 }
 
+/// Sentinel value stored in [`SignalInfo`] fields (`rssi`, `rsrp`, `rsrq`) when a
+/// metric is genuinely unavailable from the modem. AT+CSQ reporting `99,99`
+/// (unknown) and unparseable vendor signal fields both resolve to this value.
+/// A reading is "unavailable" when it sits at or below this sentinel (real dBm
+/// readings are far higher, e.g. RSRP bottoms out near -140 dBm).
+pub const UNAVAILABLE_DBM: f64 = -999.0;
+
 /// Detailed signal quality metrics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalInfo {
@@ -89,6 +96,38 @@ impl Default for SignalInfo {
             band: String::new(),
             cell_id: String::new(),
             technology: None,
+        }
+    }
+}
+
+impl SignalInfo {
+    /// A dBm reading is "available" only if it is above the unavailable sentinel.
+    /// (`<=` so a value exactly at the sentinel is treated as unavailable.)
+    fn is_available(value: f64) -> bool {
+        value > UNAVAILABLE_DBM
+    }
+
+    /// Coarse 0-100 "bars" signal indicator for status endpoints and the
+    /// WebSocket master-cache push.
+    ///
+    /// Preference order, picking the first available metric:
+    ///
+    /// 1. **RSSI** (preferred — preserves historical behavior for every modem
+    ///    that reports it, e.g. Telit). Mapped over the AT+CSQ-derived range
+    ///    -113 dBm (worst) .. -51 dBm (best): `(rssi + 113) * 100 / 62`.
+    /// 2. **RSRP** fallback. The Quectel RM520N-GL in 5G mode answers AT+CSQ
+    ///    with `99,99` (unknown), so `rssi` is the unavailable sentinel; without
+    ///    this fallback a healthy 5G link clamped to 0%. RSRP spans roughly
+    ///    -140 dBm (no signal) .. -44 dBm (excellent), a 96 dB window:
+    ///    `(rsrp + 140) * 100 / 96`. A connected modem at RSRP ≈ -90 yields ~52%.
+    /// 3. If neither metric is available, returns 0 (the prior effective value).
+    pub fn signal_strength_percent(&self) -> i32 {
+        if Self::is_available(self.rssi) {
+            ((self.rssi + 113.0) * 100.0 / 62.0).clamp(0.0, 100.0) as i32
+        } else if Self::is_available(self.rsrp) {
+            ((self.rsrp + 140.0) * 100.0 / 96.0).clamp(0.0, 100.0) as i32
+        } else {
+            0
         }
     }
 }
@@ -653,6 +692,15 @@ pub enum ModemEvent {
     /// surface only; never rendered on operator UI per `feedback_modem_mode_agnostic.md`.
     UsbNetModeDetected {
         mode: UsbNetMode,
+    },
+    /// A modem WAN is in a persistent WDS-wedge: radio registered but the data
+    /// bearer is unrecoverable after the watchdog exhausted its restarts. Operator
+    /// must reboot/power-cycle (or the opt-in guarded auto-reboot will, if enabled).
+    ModemWanWedged {
+        modem_id: String,
+        label: String,
+        restart_count: u32,
+        message: String,
     },
 }
 
@@ -1309,6 +1357,19 @@ pub struct WatchdogConfig {
     /// Maximum restart attempts before suspending restarts for a modem (default 5, range 1-50).
     #[serde(default = "default_max_restart_attempts")]
     pub max_restart_attempts: u32,
+    /// Opt-in: escalate a persistent WDS-wedge to a controlled router reboot
+    /// when the wedged modem is the sole live uplink. OFF by default.
+    #[serde(default)]
+    pub wedge_reboot_enabled: bool,
+    /// Minutes a wedge must persist (after restarts exhausted) before a reboot.
+    #[serde(default = "default_wedge_reboot_grace_mins")]
+    pub wedge_reboot_grace_mins: u32,
+    /// Hard ceiling of auto-reboots within a trailing 24h (anti-boot-loop).
+    #[serde(default = "default_wedge_reboot_max_per_day")]
+    pub wedge_reboot_max_per_day: u32,
+    /// Never auto-reboot if router uptime is below this many minutes (boot-loop guard).
+    #[serde(default = "default_wedge_reboot_min_uptime_mins")]
+    pub wedge_reboot_min_uptime_mins: u32,
 }
 
 fn default_failback_timer_mins() -> u32 { 30 }
@@ -1321,6 +1382,9 @@ fn default_http_target() -> String { "http://connectivitycheck.gstatic.com/gener
 fn default_log_retention_days() -> u32 { 14 }
 fn default_restart_cooldown_mins() -> u32 { 5 }
 fn default_max_restart_attempts() -> u32 { 5 }
+fn default_wedge_reboot_grace_mins() -> u32 { 10 }
+fn default_wedge_reboot_max_per_day() -> u32 { 2 }
+fn default_wedge_reboot_min_uptime_mins() -> u32 { 15 }
 
 impl Default for WatchdogConfig {
     fn default() -> Self {
@@ -1335,6 +1399,10 @@ impl Default for WatchdogConfig {
             restart_on_failure: false,
             restart_cooldown_mins: default_restart_cooldown_mins(),
             max_restart_attempts: default_max_restart_attempts(),
+            wedge_reboot_enabled: false,
+            wedge_reboot_grace_mins: default_wedge_reboot_grace_mins(),
+            wedge_reboot_max_per_day: default_wedge_reboot_max_per_day(),
+            wedge_reboot_min_uptime_mins: default_wedge_reboot_min_uptime_mins(),
         }
     }
 }
@@ -1475,6 +1543,9 @@ pub struct WanModemStatusEntry {
     /// Current watchdog restart count for this modem.
     #[serde(default)]
     pub restart_count: u32,
+    /// True when this modem WAN is in a persistent WDS-wedge (reboot required).
+    #[serde(default)]
+    pub wedged: bool,
     /// Load-balance weight for ECMP multipath (1–100). None = equal weight.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<u32>,
@@ -1790,5 +1861,94 @@ mod wan_modem_entry_proto_override_serde_tests {
         // And the field is omitted from re-serialization (skip_serializing_if).
         let json = serde_json::to_string(&parsed).expect("re-serialize");
         assert!(!json.contains("proto_override"), "skip_serializing_if must omit None: {json}");
+    }
+}
+
+#[cfg(test)]
+mod signal_strength_percent_tests {
+    use super::{SignalInfo, UNAVAILABLE_DBM};
+
+    fn signal(rssi: f64, rsrp: f64) -> SignalInfo {
+        SignalInfo {
+            rssi,
+            rsrp,
+            ..SignalInfo::default()
+        }
+    }
+
+    #[test]
+    fn rssi_present_matches_existing_formula_exactly() {
+        // -65 dBm RSSI: (-65 + 113) * 100 / 62 = 4800 / 62 = 77.4 -> 77.
+        // This is the unchanged historical behavior for modems that report RSSI.
+        let s = signal(-65.0, -85.0);
+        assert_eq!(s.signal_strength_percent(), 77);
+        // RSSI wins even when RSRP is also available.
+        assert_eq!(
+            s.signal_strength_percent(),
+            ((-65.0_f64 + 113.0) * 100.0 / 62.0).clamp(0.0, 100.0) as i32
+        );
+    }
+
+    #[test]
+    fn rssi_sentinel_falls_back_to_rsrp() {
+        // RSSI unavailable (Quectel RM520N-GL in 5G mode), good RSRP -90:
+        // (-90 + 140) * 100 / 96 = 5000 / 96 = 52.08 -> 52. Clearly non-zero.
+        let s = signal(UNAVAILABLE_DBM, -90.0);
+        assert_eq!(s.signal_strength_percent(), 52);
+    }
+
+    #[test]
+    fn both_sentinels_yield_zero() {
+        let s = signal(UNAVAILABLE_DBM, UNAVAILABLE_DBM);
+        assert_eq!(s.signal_strength_percent(), 0);
+    }
+
+    #[test]
+    fn rssi_sentinel_and_excellent_rsrp_clamps_to_100() {
+        let s = signal(UNAVAILABLE_DBM, -44.0);
+        assert_eq!(s.signal_strength_percent(), 100);
+    }
+}
+
+#[cfg(test)]
+mod wedge_config_tests {
+    use super::*;
+
+    #[test]
+    fn watchdog_defaults_include_wedge_reboot_off() {
+        let w = WatchdogConfig::default();
+        assert!(!w.wedge_reboot_enabled);
+        assert_eq!(w.wedge_reboot_grace_mins, 10);
+        assert_eq!(w.wedge_reboot_max_per_day, 2);
+        assert_eq!(w.wedge_reboot_min_uptime_mins, 15);
+    }
+
+    #[test]
+    fn watchdog_config_deserializes_without_wedge_fields() {
+        // Backward compat: old config files lack the new fields.
+        let json = r#"{"enabled":true,"check_interval_secs":30,"failure_threshold":3,
+            "ping_target":"8.8.8.8","dns_target":"google.com",
+            "http_target":"http://x/generate_204","log_retention_days":14,
+            "restart_on_failure":false,"restart_cooldown_mins":5,"max_restart_attempts":5}"#;
+        let w: WatchdogConfig = serde_json::from_str(json).unwrap();
+        assert!(!w.wedge_reboot_enabled);
+        assert_eq!(w.wedge_reboot_grace_mins, 10);
+    }
+}
+
+#[cfg(test)]
+mod modem_wan_wedged_event_tests {
+    use super::*;
+    #[test]
+    fn modem_wan_wedged_serializes_snake_case_tagged() {
+        let e = ModemEvent::ModemWanWedged {
+            modem_id: "2c7c:0801:c1b889a".into(),
+            label: "Quectel RM520N-GL".into(),
+            restart_count: 5,
+            message: "registered but data path unrecoverable after 5 restarts".into(),
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["type"], "modem_wan_wedged");
+        assert_eq!(v["payload"]["restart_count"], 5);
     }
 }

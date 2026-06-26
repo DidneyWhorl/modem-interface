@@ -10,7 +10,7 @@
 
 ## Authentication
 
-All endpoints except `/ctrl-modem/api/auth/*`, `/ctrl-modem/api/setup`, and `/ctrl-modem/api/license/*` require a valid session cookie.
+All endpoints except `/ctrl-modem/api/auth/*`, `/ctrl-modem/api/setup`, `/ctrl-modem/api/license/status`, and `/ctrl-modem/api/license/activate` require a valid session cookie. (`/ctrl-modem/api/license/detail` IS authenticated — it carries the full license shape; the public `/license/status` returns only `state` + `device_token`. See L-01 in the License section.)
 
 ```
 Cookie: session=<token>
@@ -51,13 +51,33 @@ Lock timeout (modem busy) → `503 Service Unavailable` + `Retry-After: N`
 
 ### License
 
-License endpoints are **public** — they bypass auth middleware, so license activation
-can function before login. The license/portal is **optional** (v1.4.0-dev.2 pivot): an
-unlicensed device has full local functionality. Activating a license only unlocks
-cloud-dependent features (see the per-feature gates below).
+The `status` and `activate` endpoints are **public** — they bypass auth middleware, so
+license activation can function before login. The license/portal is **optional**
+(v1.4.0-dev.2 pivot): an unlicensed device has full local functionality. Activating a
+license only unlocks cloud-dependent features (see the per-feature gates below).
 
-#### `GET /api/license/status`
-Return current license state and device token.
+**Public-vs-authenticated disclosure split (L-01, 2026-06-21):** the public
+`GET /api/license/status` route returns ONLY `state` + `device_token`. The sensitive
+`tier` / `expires_at` / `user_id` fields are served only on the authenticated
+`GET /api/license/detail` route (and echoed by `POST /api/license/activate`, since the
+caller supplied the key). This mirrors the `PublicSignalInfo` (cell_id) and
+`PublicModemStatus` (ip_address) reduced-public-shape pattern.
+
+#### `GET /api/license/status` (public)
+Return current license state and device token. **Reduced shape — no auth.**
+
+**Response:** `200 OK`
+```typescript
+PublicLicenseStatus = {
+  state: "unlicensed" | "valid" | "expired" | "invalid_signature" | "device_mismatch";
+  device_token: string;       // Base32 SHA-256 hardware fingerprint
+  // tier / expires_at / user_id intentionally omitted pre-auth (L-01)
+}
+```
+
+#### `GET /api/license/detail` (authenticated)
+Return the **full** license detail for the dashboard profile display. Requires a valid
+session cookie.
 
 **Response:** `200 OK`
 ```typescript
@@ -192,8 +212,27 @@ DeviceInfo = {
 #### `GET /api/modem/:modem_id/status`
 Current connection state and network info (served from 60-second cache).
 
+> **PUBLIC route (login screen, unauthenticated).** Like `GET /api/modem/:id/signal`,
+> the **per-id** status route is reachable pre-auth and returns the **reduced**
+> `PublicModemStatus` shape — identical to `ModemStatus` but **without `ip_address`**
+> (H1: an unauthenticated caller who guesses a modem_id must not read the modem's IP).
+> The full `ModemStatus` (including `ip_address`) is served on the **authenticated**
+> compat route `GET /api/modem/status` and in the WebSocket `connection_state` payload.
+
 **Response:** `200 OK`
 ```typescript
+// GET /api/modem/:modem_id/status  (PUBLIC — reduced)
+PublicModemStatus = {
+  connected: boolean;
+  technology: "2G" | "3G" | "4G" | "5G" | null;
+  operator: string | null;
+  signal_strength: number;   // 0-100 normalized (RSSI-derived; RSRP fallback when RSSI unavailable — dev.13)
+  // ip_address intentionally omitted pre-auth
+}
+```
+The authenticated compat route returns the full shape:
+```typescript
+// GET /api/modem/status  (authenticated)
 ModemStatus = {
   connected: boolean;
   technology: "2G" | "3G" | "4G" | "5G" | null;
@@ -432,7 +471,7 @@ Gate GPS polling in the 60-second cache cycle.
 GPS AT commands are only issued during the cache cycle when the panel is active.
 
 **Request:** `{ active: boolean }`
-**Response:** `200 OK` — `{ active: boolean }`
+**Response:** `200 OK` — `{ gps_panel_active: boolean }`  (echoes the new panel-gate state)
 
 ---
 
@@ -995,6 +1034,22 @@ Per-modem events include a top-level `modem_id` field.
   active_primary: string | null;
 }
 
+// WAN persistent wedge detected (BH-08) — radio registered but the data
+// bearer is unrecoverable after the watchdog exhausted its restarts.
+// Emitted ONCE per wedge transition (re-arms after the modem recovers).
+// Operator action: reboot/power-cycle (or the opt-in guarded auto-reboot
+// will, when enabled and the wedged modem is the sole live uplink).
+{
+  type: "modem_wan_wedged";
+  modem_id: string;
+  payload: {
+    modem_id: string;
+    label: string;
+    restart_count: number;
+    message: string;
+  }
+}
+
 // Error notification
 {
   type: "error";
@@ -1068,6 +1123,12 @@ The WAN manager supports two routing modes for default (non-steered) traffic:
 **Failover (default):** Single default route to the highest-priority active WAN. On failure, switches to next healthy WAN.
 
 **Load Balance:** Multipath default route distributes traffic across all active WANs proportionally by weight. Uses kernel L4 hashing (5-tuple: src IP, dst IP, src port, dst port, protocol) so each connection sticks to one WAN. Level 2 steering rules take priority over the default route.
+
+**Failback (`failback_timer_mins`):** After a failover, controls whether/when the main route auto-returns to a recovered higher-priority WAN. The value is the number of minutes the recovered WAN must stay continuously healthy (watchdog-observed) before automatic failback fires.
+- **`0` (default) = manual failback required** — auto-failback is intentionally disabled (anti-flapping). The operator restores the original primary explicitly via `POST /api/wan/failback` ("Failback Now"), which requires an active failover override. A daemon restart also reconciles the main route back to the configured primary (startup `initialize_tables`).
+- **`N > 0` = automatic failback** after `N` minutes of continuous health on the recovered WAN.
+
+Note: `PUT /api/wan/config` rebuilds the routing tables and re-pins the main route to the configured primary as a side effect (same path as startup), independent of `failback_timer_mins`.
 
 #### New fields in `GET /api/wan/status` response:
 
@@ -1272,6 +1333,78 @@ collision regardless of how either of them spells `option device` — the
 authoritative L2-binding identity is the netif.
 
 > **Bench impact:** sub-task 2b retires the manual `uci set network.<iface>.device='/dev/cdc-wdm0'` patch for QMI/MBIM modems on the M01K43-PMOD bench. Sub-task 2c (v1.3.0-dev.9) retired the requirement to click Scan to apply `proto_override` or `network_device` changes on existing modem entries — Save & Apply alone is now sufficient for all proto-affecting field changes.
+
+---
+
+### WAN Wedge Detection + Guarded Reboot (BH-08, v1.5.0-dev cycle)
+
+Some modems (bench-proven on the Quectel RM520N after an airplane-mode cycle
+that re-enumerates USB) can land in a **persistent WDS data-bearer wedge**: the
+radio reports **registered with signal** but the data path stays down, and **no
+in-place recovery clears it** — not `ifdown/ifup`, sysfs USB unbind/rebind,
+`AT+CFUN=1,1`, nor the watchdog's own restart sequence. Only a full router
+reboot recovers. The daemon detects this state distinctly from a normal
+no-signal outage, fails over + alerts (always-on), and — opt-in only —
+escalates to a guarded controlled reboot when the wedged modem is the **sole
+live uplink**. Detection is mode-agnostic (derived from existing watchdog state,
+no QMI/`uqmi` call) and harmless on modems that never wedge.
+
+#### New field in `GET /api/wan/status` response (per modem entry):
+
+```jsonc
+{
+  "modems": [
+    {
+      "modem_id": "2c7c:0801:c1b889a",
+      // ... existing fields ...
+      "wedged": false   // optional — see below
+    }
+  ]
+}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `wedged` | `boolean` (optional, default `false`) | `true` when this modem WAN is in a persistent WDS-wedge: registered with signal but the data path is unrecoverable after the watchdog exhausted its restarts. A full reboot/power-cycle is required. Cleared automatically when the data path returns healthy. Omitted/`false` for healthy entries and Ethernet WANs. |
+
+#### New fields in `PUT /api/wan/config` request (`watchdog` object):
+
+The opt-in guarded reboot escalation. All fields are `#[serde(default)]` —
+existing `wan-config.json` files without them deserialize unchanged. The reboot
+is **OFF by default**; with it off the daemon does detect + fail over + alert
+only.
+
+```jsonc
+{
+  "watchdog": {
+    // ... existing watchdog fields ...
+    "wedge_reboot_enabled": false,      // master opt-in (default false)
+    "wedge_reboot_grace_mins": 10,      // wedge must persist this long first
+    "wedge_reboot_max_per_day": 2,      // trailing-24h auto-reboot ceiling
+    "wedge_reboot_min_uptime_mins": 15  // never reboot below this uptime
+  }
+}
+```
+
+| Field | Type | Validation | Meaning |
+|-------|------|------------|---------|
+| `wedge_reboot_enabled` | `boolean` | optional, default `false` | Master opt-in. OFF = detect + failover + alert only; no reboot. |
+| `wedge_reboot_grace_mins` | `number` | optional, 1–120, default `10` | Minutes the wedge must persist (after restarts exhausted) before a reboot fires. |
+| `wedge_reboot_max_per_day` | `number` | optional, 0–10, default `2` | Hard ceiling of auto-reboots in a trailing 24 h (anti-boot-loop). `0` = never reboot (alert-only). |
+| `wedge_reboot_min_uptime_mins` | `number` | optional, 1–240, default `15` | Never auto-reboot if router uptime is below this (boot-loop guard). |
+
+**Fire condition (ALL required):** `wedge_reboot_enabled` AND the modem is
+classified wedged AND it is the **sole live uplink** (no other WAN online) AND
+the wedge has persisted ≥ `wedge_reboot_grace_mins` AND router uptime ≥
+`wedge_reboot_min_uptime_mins` AND the trailing-24 h reboot count <
+`wedge_reboot_max_per_day`. If another WAN is healthy, the daemon **never
+reboots** — failover + alert only. Anti-boot-loop reboots are recorded in a
+persisted ledger (`/etc/modem-interface/wedge-reboot-state.json`); if the ledger
+cannot be read or written, the reboot is **suppressed** (degrade-safe) and an
+escalated "boot-loop suspected — manual intervention required" alert is raised.
+
+The `modem_wan_wedged` WebSocket event (see WebSocket Events) is emitted once
+per wedge transition for operator/portal alerting.
 
 ---
 

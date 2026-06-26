@@ -73,6 +73,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Profile routes (any authenticated user)
         .route("/profile", get(routes::profile::get_profile))
         .route("/profile", put(routes::profile::update_profile))
+        // Full license detail (tier/expiry/user_id) — authenticated only.
+        // Public `/license/status` (above) returns the reduced shape (L-01).
+        .route("/license/detail", get(routes::license::get_license_detail))
         // Multi-modem routes (list all modems, global operations)
         .route("/modems", get(routes::modem::list_modems))
         .route("/modem/profiles", get(routes::modem_profiles::list_profiles))

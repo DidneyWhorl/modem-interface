@@ -1148,32 +1148,81 @@ pub async fn airplane(
 
     let command = if req.enabled { "AT+CFUN=0" } else { "AT+CFUN=1" };
 
-    timeout(STATE_CHANGE_TIMEOUT, modem.execute_at(command))
-        .await
-        .map_err(|_| ApiError::service_unavailable_with_retry("Command timed out", 1))?
-        .map_err(ApiError::from)?;
+    // BH-06: On the RM520N the CFUN write succeeds (the radio toggles) but the
+    // modem's `OK` overruns the hardware layer's internal AT read timeout, so
+    // `execute_at("AT+CFUN=N")` returns HardwareError::Timeout on a toggle that
+    // actually worked. (The CFUN=4 "fix" was bench-FALSIFIED — it times out
+    // identically; the latency is independent of the CFUN value.) Rather than
+    // fail on the write timeout, we tolerate it and VERIFY the real state via
+    // `AT+CFUN?`. Success = the verified state reflects the request.
+    let write_result = timeout(STATE_CHANGE_TIMEOUT, modem.execute_at(command)).await;
+    match write_result {
+        // Outer state-change budget elapsed, or the inner read timed out: do NOT
+        // fail yet — fall through to verify-after. Any other hardware error
+        // (e.g. the modem rejected the command outright) is a real failure.
+        Err(_) => {} // outer timeout elapsed
+        Ok(Err(crate::hardware::HardwareError::Timeout)) => {} // inner AT read timeout
+        Ok(Err(other)) => return Err(ApiError::from(other)),
+        Ok(Ok(_)) => {} // fast path: write returned OK promptly
+    }
 
-    // Brief delay for radio state to settle
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Bounded verify-after: deregistration latency (CFUN=0) can leave the first
+    // AT+CFUN? slow or reporting a transitional value, so retry a few times
+    // within the remaining state-change budget rather than trusting one shot.
+    // Each attempt: brief settle, then a QUICK_TIMEOUT-bounded AT+CFUN? query.
+    // Wall-clock ceiling stays comfortably under STATE_CHANGE_TIMEOUT (15s):
+    // 4 attempts * (500ms settle + <=5s query) is bounded by the early-exit on
+    // the first confirming read, which on real hardware lands well inside 15s.
+    const VERIFY_ATTEMPTS: usize = 4;
+    const VERIFY_SETTLE: Duration = Duration::from_millis(500);
 
-    // Query current CFUN state to confirm
-    let cfun_response = timeout(QUICK_TIMEOUT, modem.execute_at("AT+CFUN?"))
-        .await
-        .map_err(|_| ApiError::service_unavailable_with_retry("Query timed out", 1))?
-        .unwrap_or_default();
+    let mut verified_state: Option<bool> = None;
+    for attempt in 0..VERIFY_ATTEMPTS {
+        // Settle before the first query (radio state is still changing) and
+        // between retries.
+        tokio::time::sleep(VERIFY_SETTLE).await;
 
-    // Parse +CFUN: N from response
-    let airplane_active = cfun_response
-        .lines()
-        .find(|l| l.contains("+CFUN:"))
-        .and_then(|l| l.split(':').nth(1))
-        .map(|v| v.trim().starts_with('0'))
-        .unwrap_or(req.enabled);
+        let cfun_response = match timeout(QUICK_TIMEOUT, modem.execute_at("AT+CFUN?")).await {
+            Ok(Ok(resp)) => resp,
+            // Query itself timed out or errored — retry within budget.
+            _ => continue,
+        };
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "airplane_mode": airplane_active,
-    })))
+        // Parse `+CFUN: N` from the response. N==0 ⇒ radio off ⇒ airplane mode on.
+        if let Some(active) = cfun_response
+            .lines()
+            .find(|l| l.contains("+CFUN:"))
+            .and_then(|l| l.split(':').nth(1))
+            .map(|v| v.trim().starts_with('0'))
+        {
+            // Stop as soon as the verified state matches the request; otherwise
+            // keep the latest reading and retry (deregistration may be in flight).
+            verified_state = Some(active);
+            if active == req.enabled {
+                break;
+            }
+            let _ = attempt; // last reading retained for the final disagreement check
+        }
+    }
+
+    match verified_state {
+        // Verified state reflects the request → success regardless of whether the
+        // write returned Ok or timed out.
+        Some(active) if active == req.enabled => Ok(Json(serde_json::json!({
+            "success": true,
+            "airplane_mode": active,
+        }))),
+        // Verify queries all failed (could not read +CFUN:) → cannot confirm.
+        None => Err(ApiError::service_unavailable_with_retry(
+            "Airplane toggle issued but state could not be verified (CFUN query failed)",
+            1,
+        )),
+        // Verified state still disagrees with the request after the bounded retry.
+        Some(_) => Err(ApiError::service_unavailable_with_retry(
+            "Airplane toggle did not take effect (CFUN state did not match request)",
+            1,
+        )),
+    }
 }
 
 // =============================================================================
@@ -3992,8 +4041,7 @@ pub async fn signal_refresh(
             let mut cache = context.state_cache.write().await;
             if let Some(ref mut c) = *cache {
                 c.signal = signal.clone();
-                c.signal_strength =
-                    ((signal.rssi + 113.0) * 100.0 / 62.0).clamp(0.0, 100.0) as i32;
+                c.signal_strength = signal.signal_strength_percent();
                 c.timestamp = chrono::Utc::now().to_rfc3339();
             }
             let mut ls = context.last_signal.write().await;
@@ -6246,6 +6294,224 @@ mod tests {
         assert_eq!(
             res.expect_err("ReadOnly airplane must be forbidden").status,
             axum::http::StatusCode::FORBIDDEN,
+        );
+    }
+
+    // =========================================================================
+    // BH-06: airplane verify-after — tolerate the CFUN write timeout.
+    //
+    // On the RM520N the CFUN write succeeds (radio toggles) but the modem's `OK`
+    // overruns the hardware layer's internal AT read timeout, so the write call
+    // returns HardwareError::Timeout on a toggle that actually worked. The fixed
+    // `airplane` handler must NOT fail on that write timeout — it must verify the
+    // real state via `AT+CFUN?` and return success when the state matches.
+    //
+    // MockHardware returns bare "OK" for all CFUN commands and can't model a
+    // write-timeout-then-confirming-query, so we define a small test-only double
+    // that delegates every trait method to an inner MockHardware EXCEPT
+    // execute_at, which we override per-command.
+    // =========================================================================
+
+    /// Test double: `AT+CFUN=N` (the write) behaves as the caller configures
+    /// (timeout / ok / error), while `AT+CFUN?` (the verify) reports a fixed
+    /// `+CFUN:` state. Everything else delegates to an inner MockHardware.
+    struct CfunVerifyDouble {
+        inner: MockHardware,
+        /// What the CFUN *write* returns.
+        write_result: WriteOutcome,
+        /// What `AT+CFUN?` reports: true = radio off (+CFUN: 0), false = on (+CFUN: 1).
+        verify_radio_off: bool,
+    }
+
+    #[derive(Clone, Copy)]
+    enum WriteOutcome {
+        Timeout,
+    }
+
+    #[async_trait::async_trait]
+    impl ModemHardware for CfunVerifyDouble {
+        async fn execute_at(&self, command: &str) -> Result<String, crate::hardware::HardwareError> {
+            let upper = command.to_uppercase();
+            if upper.starts_with("AT+CFUN=") {
+                // The write command.
+                return match self.write_result {
+                    WriteOutcome::Timeout => Err(crate::hardware::HardwareError::Timeout),
+                };
+            }
+            if upper.starts_with("AT+CFUN?") {
+                // The verify query — report the configured state.
+                let n = if self.verify_radio_off { 0 } else { 1 };
+                return Ok(format!("+CFUN: {n}\n\nOK"));
+            }
+            self.inner.execute_at(command).await
+        }
+
+        // --- everything else delegates to the inner mock ---------------------
+        async fn get_device_info(&self) -> Result<DeviceInfo, crate::hardware::HardwareError> {
+            self.inner.get_device_info().await
+        }
+        async fn get_status(&self) -> Result<ModemStatus, crate::hardware::HardwareError> {
+            self.inner.get_status().await
+        }
+        async fn get_signal(&self) -> Result<SignalInfo, crate::hardware::HardwareError> {
+            self.inner.get_signal().await
+        }
+        async fn get_data_stats(&self) -> Result<DataStats, crate::hardware::HardwareError> {
+            self.inner.get_data_stats().await
+        }
+        async fn connect(&self, config: &ConnectionConfig) -> Result<(), crate::hardware::HardwareError> {
+            self.inner.connect(config).await
+        }
+        async fn disconnect(&self) -> Result<(), crate::hardware::HardwareError> {
+            self.inner.disconnect().await
+        }
+        async fn reconnect(&self) -> Result<(), crate::hardware::HardwareError> {
+            self.inner.reconnect().await
+        }
+        async fn get_sim_status(&self) -> Result<SimStatus, crate::hardware::HardwareError> {
+            self.inner.get_sim_status().await
+        }
+        async fn verify_pin(&self, pin: &str) -> Result<(), crate::hardware::HardwareError> {
+            self.inner.verify_pin(pin).await
+        }
+        async fn change_pin(&self, old_pin: &str, new_pin: &str) -> Result<(), crate::hardware::HardwareError> {
+            self.inner.change_pin(old_pin, new_pin).await
+        }
+        async fn enable_pin(&self, pin: &str) -> Result<(), crate::hardware::HardwareError> {
+            self.inner.enable_pin(pin).await
+        }
+        async fn disable_pin(&self, pin: &str) -> Result<(), crate::hardware::HardwareError> {
+            self.inner.disable_pin(pin).await
+        }
+        async fn get_registration(&self) -> Result<RegistrationState, crate::hardware::HardwareError> {
+            self.inner.get_registration().await
+        }
+        async fn scan_networks(
+            &self,
+        ) -> Result<Vec<crate::hardware::AvailableNetwork>, crate::hardware::HardwareError> {
+            self.inner.scan_networks().await
+        }
+        async fn select_network(
+            &self,
+            operator_code: Option<&str>,
+        ) -> Result<(), crate::hardware::HardwareError> {
+            self.inner.select_network(operator_code).await
+        }
+    }
+
+    /// Build an AppState whose only modem is a `CfunVerifyDouble`.
+    async fn make_test_state_with_cfun_double(
+        modem_id: &str,
+        write_result: WriteOutcome,
+        verify_radio_off: bool,
+    ) -> Arc<AppState> {
+        let config = AppConfig::default();
+        let users = UserStore::load("/nonexistent/users.json").await;
+        let registry = ProfileRegistry::load();
+        let state = Arc::new(AppState::new(
+            config,
+            users,
+            registry,
+            "test-device-token".to_string(),
+            Arc::new(crate::security::device_auth::DeviceAuth::ephemeral()),
+            LicenseState::Unlicensed,
+        ));
+
+        let double = CfunVerifyDouble {
+            inner: MockHardware::new(),
+            write_result,
+            verify_radio_off,
+        };
+        let profile = state.profile_registry.generic().clone();
+        let detected = DetectedModem {
+            device_path: "/dev/ttyUSB0".to_string(),
+            protocol: ModemProtocol::At,
+            description: "CFUN verify double".to_string(),
+            vendor_id: Some("0000".to_string()),
+            product_id: Some("0000".to_string()),
+            profile_id: None,
+            has_profile: false,
+            bus_port: None,
+            all_ports: vec![],
+        };
+        let conn_config = ConnectionConfig {
+            cid: 1,
+            apn: "test.apn".to_string(),
+            username: None,
+            password: None,
+            auth_type: AuthType::None,
+            ip_type: IpType::Ipv4,
+        };
+        state
+            .add_modem(
+                modem_id.to_string(),
+                Box::new(double),
+                profile,
+                detected,
+                conn_config,
+                DiscoveryInfo::default(),
+            )
+            .await;
+        state
+    }
+
+    #[tokio::test]
+    async fn airplane_write_timeout_is_tolerated_when_verify_confirms() {
+        // BH-06: the CFUN write returns Timeout, but AT+CFUN? reports radio-off
+        // (+CFUN: 0). The handler must tolerate the write timeout and return
+        // 200 {success:true, airplane_mode:true} driven by the verify.
+        let modem_id = "test:cfun:verify_ok";
+        let state =
+            make_test_state_with_cfun_double(modem_id, WriteOutcome::Timeout, /*radio_off=*/ true)
+                .await;
+
+        let Json(body) = airplane(
+            Path(modem_id.to_string()),
+            State(state),
+            Extension(test_operator()),
+            Json(AirplaneModeRequest { enabled: true }),
+        )
+        .await
+        .expect("airplane must return Ok when verify confirms radio-off despite write timeout");
+
+        assert_eq!(
+            body["success"],
+            serde_json::json!(true),
+            "verify-after must drive success on a write timeout"
+        );
+        assert_eq!(
+            body["airplane_mode"],
+            serde_json::json!(true),
+            "verified state must report airplane_mode:true (radio off)"
+        );
+    }
+
+    #[tokio::test]
+    async fn airplane_write_timeout_errors_when_verify_disagrees() {
+        // The CFUN write times out AND AT+CFUN? keeps reporting the OLD state
+        // (+CFUN: 1, radio still on) for an enable request. The bounded verify
+        // never confirms, so the handler must return an error (not a false 200).
+        let modem_id = "test:cfun:verify_fail";
+        let state = make_test_state_with_cfun_double(
+            modem_id,
+            WriteOutcome::Timeout,
+            /*radio_off=*/ false,
+        )
+        .await;
+
+        let res = airplane(
+            Path(modem_id.to_string()),
+            State(state),
+            Extension(test_operator()),
+            Json(AirplaneModeRequest { enabled: true }),
+        )
+        .await;
+
+        let err = res.expect_err("unconfirmed airplane toggle must return an error");
+        assert_eq!(
+            err.status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "unverified toggle should map to a service-unavailable/retry class error"
         );
     }
 

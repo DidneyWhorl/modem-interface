@@ -83,6 +83,19 @@ fn authority_of(value: &str) -> Option<String> {
     Some(host_port.to_ascii_lowercase())
 }
 
+/// Select the request's effective authority (`host:port`) for the same-origin
+/// comparison. Prefers the HTTP/1.1 `Host` header when present; otherwise falls
+/// back to the URI authority, which carries the HTTP/2 `:authority` pseudo-header
+/// (hyper/axum exposes it via `request.uri().authority()`, never via the `Host`
+/// header on h2 requests). Returns `None` only when both are absent. Pure function —
+/// unit-tested below.
+fn effective_host<'a>(
+    host_header: Option<&'a str>,
+    uri_authority: Option<&'a str>,
+) -> Option<&'a str> {
+    host_header.or(uri_authority)
+}
+
 /// Decide whether a state-changing request should be allowed, given the relevant
 /// header values and whether the request's source IP is loopback. Pure function —
 /// unit-tested below.
@@ -143,10 +156,18 @@ pub async fn csrf_middleware(
 
     let peer_is_loopback = peer.map(|ci| ci.0.ip().is_loopback()).unwrap_or(false);
 
+    // HTTP/2 carries the authority in the `:authority` pseudo-header (exposed via
+    // the request URI), NOT in a `Host` header. Capture it before borrowing
+    // headers so we can fall back to it when the `Host` header is absent.
+    let uri_authority = request.uri().authority().map(|a| a.as_str());
+
     let headers = request.headers();
-    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    let host_header = headers.get(header::HOST).and_then(|v| v.to_str().ok());
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
     let referer = headers.get(header::REFERER).and_then(|v| v.to_str().ok());
+
+    // HTTP/2-aware host: prefer the `Host` header, fall back to the URI authority.
+    let host = effective_host(host_header, uri_authority);
 
     if csrf_allows(peer_is_loopback, host, origin, referer) {
         return next.run(request).await;
@@ -315,6 +336,84 @@ mod tests {
             false,
             Some("router.local:8443"),
             Some("https://portal.ctrl-modem.com"),
+            None
+        ));
+    }
+
+    // --- HTTP/2 `:authority` fallback (effective_host). Under h2 there is no
+    // `Host` header; the authority is carried in the URI. The middleware must use
+    // the URI authority as the effective host so a same-origin h2 request matches
+    // its Origin exactly as an HTTP/1.1 one does. ---
+
+    #[test]
+    fn effective_host_prefers_host_header() {
+        // When both are present, the Host header wins (HTTP/1.1 behavior).
+        assert_eq!(
+            effective_host(Some("router.local:8443"), Some("uri.example:9999")),
+            Some("router.local:8443")
+        );
+    }
+
+    #[test]
+    fn effective_host_falls_back_to_uri_authority() {
+        // HTTP/2: no Host header → use the URI authority (`:authority`).
+        assert_eq!(
+            effective_host(None, Some("router.local:8443")),
+            Some("router.local:8443")
+        );
+    }
+
+    #[test]
+    fn effective_host_none_when_both_absent() {
+        assert_eq!(effective_host(None, None), None);
+    }
+
+    #[test]
+    fn http2_same_origin_via_uri_authority_allows() {
+        // Regression: browser over HTTP/2 sends no Host header; the same-origin
+        // authority arrives via the URI (`:authority`). Feeding the effective host
+        // into csrf_allows must ALLOW the same-origin mutation.
+        let host = effective_host(None, Some("192.168.1.1:8443"));
+        assert!(csrf_allows(
+            false,
+            host,
+            Some("https://192.168.1.1:8443"),
+            None
+        ));
+    }
+
+    #[test]
+    fn http2_cross_origin_via_uri_authority_rejected() {
+        // HTTP/2 with no Host header but a cross-origin Origin must still REJECT.
+        let host = effective_host(None, Some("192.168.1.1:8443"));
+        assert!(!csrf_allows(
+            false,
+            host,
+            Some("https://evil.example.com"),
+            None
+        ));
+    }
+
+    #[test]
+    fn http2_cross_origin_different_port_via_uri_authority_rejected() {
+        let host = effective_host(None, Some("192.168.1.1:8443"));
+        assert!(!csrf_allows(
+            false,
+            host,
+            Some("https://192.168.1.1:9999"),
+            None
+        ));
+    }
+
+    #[test]
+    fn http1_host_header_still_used_when_present() {
+        // HTTP/1.1 unchanged: Host header present is used and wins over any URI
+        // authority, preserving same-origin ALLOW.
+        let host = effective_host(Some("router.local:8443"), Some("ignored:1"));
+        assert!(csrf_allows(
+            false,
+            host,
+            Some("https://router.local:8443"),
             None
         ));
     }

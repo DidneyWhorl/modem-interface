@@ -1372,6 +1372,7 @@ async fn build_status_response(state: &AppState) -> WanStatusResponse {
                 imei: modem_imeis.get(&entry.modem_id).cloned().flatten(),
                 restart_suspended: runtime_info.map(|r| r.restart_suspended).unwrap_or(false),
                 restart_count: runtime_info.map(|r| r.restart_count).unwrap_or(0),
+                wedged: runtime_info.map(|r| r.wedged).unwrap_or(false),
                 weight: entry.weight,
                 proto_override: entry.proto_override.clone(),
                 // Diagnostic only — Ethernet entries have no modem to query.
@@ -1750,6 +1751,25 @@ pub async fn update_wan_config(
     if new_config.watchdog.max_restart_attempts < 1 || new_config.watchdog.max_restart_attempts > 50 {
         return Err(ApiError::bad_request(
             "Max restart attempts must be between 1 and 50",
+        ));
+    }
+    if new_config.watchdog.wedge_reboot_grace_mins < 1
+        || new_config.watchdog.wedge_reboot_grace_mins > 120
+    {
+        return Err(ApiError::bad_request(
+            "wedge_reboot_grace_mins must be 1-120",
+        ));
+    }
+    if new_config.watchdog.wedge_reboot_max_per_day > 10 {
+        return Err(ApiError::bad_request(
+            "wedge_reboot_max_per_day must be 0-10",
+        ));
+    }
+    if new_config.watchdog.wedge_reboot_min_uptime_mins < 1
+        || new_config.watchdog.wedge_reboot_min_uptime_mins > 240
+    {
+        return Err(ApiError::bad_request(
+            "wedge_reboot_min_uptime_mins must be 1-240",
         ));
     }
     if !matches!(new_config.failback_timer_mins, 0 | 15 | 30 | 60 | 360 | 720) {
@@ -2693,6 +2713,8 @@ pub async fn scan_wan(
                     restart_count: 0,
                     restart_suspended: false,
                     healthy_since: None,
+                    wedged: false,
+                    wedged_since: None,
                 });
             // Update SIM status from scan results
             if let Some(sim) = has_sim {
@@ -2726,6 +2748,8 @@ pub async fn scan_wan(
                     restart_count: 0,
                     restart_suspended: false,
                     healthy_since: None,
+                    wedged: false,
+                    wedged_since: None,
                 });
         }
     }
@@ -2979,6 +3003,8 @@ pub async fn add_ethernet(
                 restart_count: 0,
                 restart_suspended: false,
                 healthy_since: None,
+                wedged: false,
+                wedged_since: None,
             },
         );
     }

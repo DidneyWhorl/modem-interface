@@ -1,0 +1,76 @@
+# public-manifest.txt — explicit INCLUDE allowlist for the public mirror.
+#
+# Consumed by scripts/publish-public.sh. This is an ALLOWLIST, not a denylist:
+# only paths matched here are ever copied into the public staging tree. Anything
+# not listed defaults to PRIVATE (spec D5 / §4). A forgotten exclude cannot leak.
+#
+# Format (line-oriented, machine-readable):
+#   - One entry per line.
+#   - Blank lines and lines beginning with '#' are ignored.
+#   - An entry is a path relative to the repo root. A trailing '/' means
+#     "this directory, recursively". A leading '!' means EXCLUDE (a carve-out
+#     applied AFTER includes, so a directory can be pulled in then trimmed).
+#   - Globs (*, ?) are honored by the shell when the publish script expands them.
+#
+# Source of truth: docs/superpowers/specs/2026-06-19-repo-split-public-mirror-design.md §4
+#
+# NOTE (verified at manifest-author time against the v1.4.0 tag):
+#   - backend/build.rs is listed per spec but does NOT exist in the tree; the
+#     publish script skips missing includes (warns, does not fail).
+#   - docs/Modem_documentation/ is listed per spec but is gitignored and thus
+#     NOT tracked; it exports as a no-op. Listed for forward-compatibility.
+
+# ---- frontend (UI source) ------------------------------------------------
+frontend/
+# build artifact — never publish
+!frontend/tsconfig.tsbuildinfo
+# internal CLAUDE-Code authoring ruleset (sibling of the excluded root CLAUDE.md)
+!frontend/CLAUDE_UI-UX.md
+# internal deploy helper (same class as the excluded scripts/deploy-*)
+!frontend/deploy.ps1
+
+# ---- backend (Rust source + manifests; target/ already gitignored) -------
+backend/src/
+backend/Cargo.toml
+backend/Cargo.lock
+backend/build.rs
+
+# ---- openwrt packaging (sanitized in Phase B) ----------------------------
+openwrt/
+
+# ---- build-only scripts (NO deploy/feed/CI scripts) ----------------------
+scripts/build-apk.sh
+scripts/build-backend.ps1
+scripts/build-backend-mipsel.sh
+scripts/build-frontend.ps1
+scripts/build-ipk.ps1
+scripts/build-ipk.sh
+scripts/build-openwrt-package.ps1
+scripts/assert-binary-size.sh
+scripts/test-assert-binary-size.sh
+scripts/check-no-aws-lc.sh
+scripts/version-translate.sh
+scripts/test-version-translate.sh
+# publish tooling itself — safe to publish (references only the PUBLIC GitHub
+# repo + public feed URLs; contains no private infra). See report decision note.
+scripts/public-manifest.txt
+scripts/publish-public.sh
+scripts/test-publish-public.sh
+
+# ---- curated public docs (ISSUES-AND-ROADMAP.md stays PRIVATE, D7) --------
+docs/API-CONTRACT.md
+docs/HARDWARE-TRAIT.md
+docs/VERSIONING.md
+docs/Modem_documentation/
+
+# ---- top-level project files ---------------------------------------------
+LICENSE
+LICENSES-THIRD-PARTY.md
+CONTRIBUTING.md
+README.md
+AUTHORS
+.gitignore
+# .env.example — audited Phase C: no real values (placeholder token + default
+# LAN IP only). The private-infra hostname in its comments is rewritten by the
+# publish script's defensive URL-substitution transform.
+.env.example

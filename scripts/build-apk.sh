@@ -160,7 +160,7 @@ apk mkpkg \
     --info "license:proprietary" \
     --info "url:https://ctrl-modem.com" \
     --info "maintainer:agccc <agccc@netsolution.shop>" \
-    --info "depends:openssl-util ca-bundle" \
+    --info "depends:ca-bundle" \
     --script "post-install:${CORE_POSTINST}" \
     --script "pre-deinstall:${CORE_PRERM}" \
     --files "${CORE_DATA}" \

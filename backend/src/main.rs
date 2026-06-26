@@ -26,6 +26,8 @@ mod config;
 mod hardware;
 mod security;
 mod state;
+#[cfg(feature = "tls")]
+mod tls_cert;
 
 use hardware::AppConfig;
 #[cfg(feature = "mock-hardware")]
@@ -412,13 +414,10 @@ async fn try_start_tls(
     let cert_path = Path::new(&tls_config.cert_path);
     let key_path = Path::new(&tls_config.key_path);
 
-    if !cert_path.exists() || !key_path.exists() {
-        anyhow::bail!(
-            "TLS cert not found at {} and/or key at {}",
-            tls_config.cert_path,
-            tls_config.key_path
-        );
-    }
+    // If the cert/key are missing, self-generate them in-binary (replaces the
+    // old openssl-util first-boot dependency). Idempotent: a no-op when both
+    // files already exist, so existing installs keep their current cert.
+    tls_cert::ensure_self_signed_cert(cert_path, key_path)?;
 
     let rustls_config = RustlsConfig::from_pem_file(&tls_config.cert_path, &tls_config.key_path)
         .await

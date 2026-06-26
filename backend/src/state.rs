@@ -295,6 +295,31 @@ pub struct WanModemRuntimeInfo {
     /// When this WAN last transitioned to healthy. Used for stabilization gating
     /// on failback decisions. None = not currently healthy or never checked.
     pub healthy_since: Option<tokio::time::Instant>,
+    /// True once a persistent WDS-wedge has been classified (registered + data-down
+    /// after restarts exhausted). Cleared when the data path returns healthy.
+    pub wedged: bool,
+    /// When the wedge was first classified — drives the reboot grace window.
+    pub wedged_since: Option<tokio::time::Instant>,
+}
+
+impl WanModemRuntimeInfo {
+    /// Minimal constructor for unit tests — all optional/bool fields start at
+    /// their safe defaults. Not compiled into production builds.
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        Self {
+            status: crate::hardware::WanModemStatus::Offline,
+            consecutive_failures: 0,
+            last_check: None,
+            network_device: None,
+            has_sim: None,
+            restart_count: 0,
+            restart_suspended: false,
+            healthy_since: None,
+            wedged: false,
+            wedged_since: None,
+        }
+    }
 }
 
 impl AppState {
@@ -652,5 +677,17 @@ mod tests {
         // "changed" by string inequality → Some("") so the contract is "differ ⇒
         // Some". The cache caller gates on the cell being a real reopen value.
         assert_eq!(reconcile_device_path("/dev/ttyUSB2", ""), Some(String::new()));
+    }
+}
+
+#[cfg(test)]
+mod wedge_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_info_defaults_not_wedged() {
+        let info = WanModemRuntimeInfo::new_for_test();
+        assert!(!info.wedged);
+        assert!(info.wedged_since.is_none());
     }
 }

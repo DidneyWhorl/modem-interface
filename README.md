@@ -10,6 +10,25 @@ modem from a single screen.
 ![CTRL-Modem dashboard](docs/assets/ui.gif)
 <!-- TODO: add docs/assets/ui.gif -->
 
+## A Note From Didney
+
+**Full transparency up front.**
+
+Didney here. I want to be sure there is no confusion on this project, as I
+believe in transparency when it comes to capability and work.
+I completely designed the plan for this project, and worked for months
+(started in about Feb 2026 I believe) to get this project to it's current point
+(writing this on 06/25/2026). Every part of the application I iterated the ideas
+and layout, and useful functions, and tested on every thing I could. The stack
+for it all I chose based on how I believe(d) the specific parts would perform for
+the needs I wanted to fulfill.
+The CODE I wrote 0% of. NONE. All was done with LLMs. Mostly Claude, as it evolved
+over the last 4-5 months, but some other LLMs sprinkled in from time to time.
+I do not in any way want to represent the code as my own knowledge created work.
+I don't have the skills in that area, yet. I did on the other hand use my knowledge
+with cellular modems and connectivity and such to help guide the functionality.
+I hope you can use what "I've" made here, and I welcome any and all feedback.
+
 ## Features
 
 - **Real-time signal monitoring** — live RSRP, RSRQ, and SINR, plus active bands
@@ -45,7 +64,7 @@ likely to work as well.
 
 ## Install
 
-Current stable version: **1.4.1**
+Current stable version: **1.5.0**
 
 OpenWRT ships one of two package managers depending on its version: **`opkg`**
 (OpenWRT 23.05 and earlier) and **`apk`** (apk-tools 3.x, OpenWRT 24.10 and
@@ -118,3 +137,12 @@ the **Apache License 2.0**.
 ## Contributing
 
 Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) to get started.
+
+## Acknowledgments
+
+Every line of CTRL-Modem's source code was written by **Claude**, Anthropic's AI
+assistant, under the design and direction of Didney — see
+[*A Note From Didney*](#a-note-from-didney) above for the full story. Most of the
+work was done with Claude; other LLMs contributed from time to time.
+
+— [anthropic.com](https://www.anthropic.com)

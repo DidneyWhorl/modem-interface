@@ -17,7 +17,9 @@ modem-interface-*.tar.gz
 .idea/
 .claude/
 .superpowers/
+.codex/
 CLAUDE.md
+AGENTS.md
 *.swp
 *.swo
 *~
@@ -66,6 +68,8 @@ cookies.txt
 *.pem
 *.key
 *.sec
+# stray local secrets dropfile — matched by a glob (no infra-tool name; .gitignore is published)
+*Seekrets*
 
 # Windows artifacts
 nul

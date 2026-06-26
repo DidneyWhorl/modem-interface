@@ -1,6 +1,6 @@
 Package: modem-interface
 Version: 1.0.7-1
-Depends: libc, kmod-usb-serial, kmod-usb-serial-option, kmod-usb-serial-wwan, openssl-util, ca-bundle
+Depends: libc, kmod-usb-serial, kmod-usb-serial-option, kmod-usb-serial-wwan, ca-bundle
 Recommends: luci-app-ctrl-modem, modem-interface-nginx
 Source: ctrl-modem
 Section: net

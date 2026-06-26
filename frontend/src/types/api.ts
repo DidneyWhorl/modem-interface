@@ -847,9 +847,30 @@ export interface ApnApplyResult {
 // License Types
 // ============================================================================
 
-export interface LicenseStatus {
-  state: 'unlicensed' | 'valid' | 'expired' | 'invalid_signature' | 'device_mismatch';
+export type LicenseState =
+  | 'unlicensed'
+  | 'valid'
+  | 'expired'
+  | 'invalid_signature'
+  | 'device_mismatch';
+
+/**
+ * Reduced, PUBLIC license shape returned by the unauthenticated
+ * `GET /license/status` route (L-01). Carries only `state` + `device_token` —
+ * the activation screen's needs — without disclosing tier/expiry/user_id to
+ * unauthenticated callers.
+ */
+export interface PublicLicenseStatus {
+  state: LicenseState;
   device_token: string;
+}
+
+/**
+ * Full license shape returned by the AUTHENTICATED `GET /license/detail` route
+ * (and echoed by `POST /license/activate`). Includes the sensitive
+ * tier/expiry/user_id fields used by the dashboard's profile display.
+ */
+export interface LicenseStatus extends PublicLicenseStatus {
   tier?: string;
   expires_at?: string;
   user_id?: string;

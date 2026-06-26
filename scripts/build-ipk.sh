@@ -136,7 +136,7 @@ mkdir -p "$CORE_CTRL"
 cat > "${CORE_CTRL}/control" <<CTRL
 Package: modem-interface
 Version: ${OPKG_VERSION}-${PKG_RELEASE}
-Depends: openssl-util, ca-bundle
+Depends: ca-bundle
 Recommends: luci-app-ctrl-modem
 Source: ctrl-modem
 Section: net

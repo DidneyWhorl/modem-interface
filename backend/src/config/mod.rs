@@ -8,6 +8,7 @@ pub mod env;
 pub mod portal;
 pub mod sim_slots;
 pub mod wan;
+pub mod wedge_reboot;
 
 pub use env::EnvConfig;
 pub use env::current_env;

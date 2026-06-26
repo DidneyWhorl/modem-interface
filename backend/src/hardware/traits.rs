@@ -894,6 +894,11 @@ pub mod real_hardware {
         /// reads never contend with an in-flight AT exchange. Cloned out via
         /// `live_device_path_handle` for the cache-task reconcile.
         live_device_path: std::sync::Arc<std::sync::Mutex<String>>,
+        /// Per-channel carryover state (post-timeout settle-drain arm + observed
+        /// echo). Mutated only while the `port` async lock is held in
+        /// `send_command`, so the exchange serialization that protects the port
+        /// also protects this; the inner sync `Mutex` is just to keep `&self`.
+        channel_sync: std::sync::Mutex<super::ChannelSync>,
     }
 
     impl AtHandler {
@@ -955,6 +960,7 @@ pub mod real_hardware {
                 bus_port,
                 connect_time: std::sync::Mutex::new(None),
                 live_device_path: std::sync::Arc::new(std::sync::Mutex::new(device_path.to_string())),
+                channel_sync: std::sync::Mutex::new(super::ChannelSync::default()),
             })
         }
 
@@ -1154,9 +1160,32 @@ pub mod real_hardware {
 
             let mut port = self.port.lock().await;
 
+            // Take the per-channel carryover state into a local for the duration
+            // of this exchange. Safe to snapshot/restore: the held `port` lock
+            // serializes ALL exchanges on this channel, so no other exchange can
+            // touch `channel_sync` while we hold `port`. On lock poison fall back
+            // to a fresh default (worst case the next exchange skips the settle-
+            // drain — no correctness loss, R1 still runs).
+            let mut sync = self
+                .channel_sync
+                .lock()
+                .map(|g| *g)
+                .unwrap_or_default();
+
             let mut opener = HandlerPortOpener { handler: self };
-            let result =
-                super::run_at_command_with_reopen(&mut *port, &mut opener, cmd, cmd_timeout);
+            let result = super::run_at_command_with_reopen(
+                &mut *port,
+                &mut opener,
+                cmd,
+                cmd_timeout,
+                &mut sync,
+            );
+
+            // Persist the updated carryover state for the next exchange. Best-
+            // effort on poison (same rationale as above).
+            if let Ok(mut g) = self.channel_sync.lock() {
+                *g = sync;
+            }
 
             match &result {
                 Ok(response) => {
@@ -1637,10 +1666,29 @@ pub mod real_hardware {
         }
 
         async fn get_data_stats(&self) -> HardwareResult<DataStats> {
-            // AT commands don't provide data stats directly
+            // AT commands don't expose byte counters, but the kernel does. Resolve
+            // THIS modem's data interface via its USB bus-port (same path used by
+            // check_interface_status / get_modem_mac_address) and read the netdev
+            // statistics. These counters are mode-agnostic (ECM/QMI/MBIM/rmnet) —
+            // never branch on usbnet mode or modem model.
+            let (bytes_tx, bytes_rx) = self
+                .bus_port
+                .as_deref()
+                .and_then(find_net_device_for_bus_port)
+                .and_then(|netif| read_netdev_byte_counters(&netif))
+                .unwrap_or((0, 0)); // degrade gracefully to zeros on any resolution/read failure
+
+            // session_uptime_secs: best-effort only. There is no reliable,
+            // mode-agnostic source for "seconds since the data session came up" —
+            // the kernel netdev `statistics/` has no session-start timestamp, and
+            // AT registration time doesn't equal data-bearer-up time. Rather than
+            // fabricate a value (e.g. interface carrier-up, which resets on USB
+            // re-enumeration and isn't the data session) or add heavyweight
+            // state-tracking, we report 0. The mock impl supplies a real uptime for
+            // tests; the contract semantics are defined there.
             Ok(DataStats {
-                bytes_tx: 0,
-                bytes_rx: 0,
+                bytes_tx,
+                bytes_rx,
                 session_uptime_secs: 0,
             })
         }
@@ -2875,6 +2923,41 @@ pub mod real_hardware {
         None
     }
 
+    /// Read cumulative TX/RX byte counters for a network interface.
+    ///
+    /// Reads the kernel netdev statistics at
+    /// `/sys/class/net/<netif>/statistics/{tx_bytes,rx_bytes}`. These are
+    /// monotonically-increasing counters maintained by the kernel and are
+    /// **mode-agnostic**: they work identically for ECM (usb*), QMI/rmnet
+    /// (wwan*), and MBIM interfaces because they are plain netdev counters,
+    /// not anything the usbnet sub-driver special-cases. Returns
+    /// `Some((tx_bytes, rx_bytes))` on success, or `None` on any failure
+    /// (missing file, unreadable, unparseable) so callers can degrade to zero.
+    pub fn read_netdev_byte_counters(netif: &str) -> Option<(u64, u64)> {
+        read_netdev_byte_counters_in(Path::new("/sys/class/net"), netif)
+    }
+
+    /// Test-injectable variant of [`read_netdev_byte_counters`] — reads the
+    /// statistics files under an arbitrary `class_net_root` (production passes
+    /// `/sys/class/net`).
+    pub fn read_netdev_byte_counters_in(
+        class_net_root: &Path,
+        netif: &str,
+    ) -> Option<(u64, u64)> {
+        let stats_dir = class_net_root.join(netif).join("statistics");
+        let tx = fs::read_to_string(stats_dir.join("tx_bytes"))
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        let rx = fs::read_to_string(stats_dir.join("rx_bytes"))
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        Some((tx, rx))
+    }
+
     /// Extract USB interface number from a ttyUSB device's sysfs path.
     ///
     /// Given "ttyUSB5", resolves the sysfs path and finds the USB interface
@@ -3133,6 +3216,46 @@ pub fn is_device_gone_errno(raw: Option<i32>) -> bool {
 #[allow(dead_code)] // used by real-hardware send_command and tests
 pub trait SerialIo: std::io::Read + std::io::Write + Send {}
 
+/// Per-channel carryover state threaded across consecutive AT exchanges on the
+/// same serial port (2026-06-22 post-timeout carryover hardening, follow-up to
+/// the dev.57 read-framing spec).
+///
+/// AT access is strictly serialized (every exchange funnels through
+/// `send_command` holding `self.port.lock()`), so this is NOT byte-interleaving —
+/// it is **temporal carryover across the lock boundary**: a timed-out command's
+/// response can land in the buffer *after* the lock is released and surface in
+/// the NEXT exchange. R1's non-blocking drain runs before those late bytes arrive
+/// and misses them. This struct lets one exchange tell the next that recovery is
+/// needed, and remembers whether the channel echoes so a pre-echo line can be
+/// classified as carryover (R-A/R-B).
+///
+/// Lives on `AtHandler` and is mutated only while the `port` lock is held, so the
+/// serialization that protects the port also protects this state.
+#[derive(Debug, Default, Clone, Copy)]
+#[allow(dead_code)] // fields read by at_exchange on the real-hardware path + tests
+pub struct ChannelSync {
+    /// The previous exchange on this channel ended in `Timeout`. The next
+    /// exchange must run a bounded *blocking* settle-drain (not just R1's
+    /// non-blocking sweep) to let the timed-out command's late response arrive
+    /// and be discarded before we write. Cleared once a clean exchange completes.
+    pub prev_timed_out: bool,
+    /// This channel has been observed echoing its own command at least once
+    /// (echo is ON — always true for deployment modems; the daemon never issues
+    /// `ATE0`). Once true, a pre-echo body/terminal line is carryover *by
+    /// definition* and must be discarded, never returned — the ATE0
+    /// degrade-safely accept clause is reachable ONLY while this is false.
+    pub ever_echoed: bool,
+}
+
+/// Hard ceiling on the post-timeout settle-drain (R-E): a few cycles of the
+/// 100 ms serial read timeout. A healthy channel that did NOT time out skips the
+/// settle-drain entirely (pays ~0); a channel recovering from a timeout gets a
+/// brief, bounded window for the late response to arrive and be discarded; a dead
+/// channel cannot wedge here (bounded loop, `TimedOut`/`WouldBlock`/EOF still
+/// ends each pass — the no-`tcdrain` wedge does not return).
+#[allow(dead_code)] // used by real-hardware send_command and tests
+const POST_TIMEOUT_SETTLE_PASSES: usize = 5;
+
 /// Re-detects the AT port for the handler's stable bus-port and opens a fresh
 /// `SerialIo`. The real opener performs `at_ports_for_bus_port` + a fresh-port
 /// AT/OK verify; test fakes hand out scripted ports. Returns an `Err` when
@@ -3158,6 +3281,7 @@ pub fn run_at_command_with_reopen<S, O>(
     opener: &mut O,
     cmd: &str,
     cmd_timeout: std::time::Duration,
+    sync: &mut ChannelSync,
 ) -> HardwareResult<String>
 where
     S: SerialIo,
@@ -3165,12 +3289,23 @@ where
 {
     let mut reopened = false;
     loop {
-        match at_exchange(port, cmd, cmd_timeout) {
-            Ok(resp) => return Ok(resp),
-            Err(AtExchangeError::Timeout) => return Err(HardwareError::Timeout),
+        match at_exchange(port, cmd, cmd_timeout, sync) {
+            Ok(resp) => {
+                // Clean exchange — the channel is back in sync; the next command
+                // skips the post-timeout settle-drain (R-B recover-on-next-cmd).
+                sync.prev_timed_out = false;
+                return Ok(resp);
+            }
+            Err(AtExchangeError::Timeout) => {
+                // Arm the settle-drain for the NEXT exchange: this command's late
+                // response may still arrive after the lock releases (R-A/R-B).
+                sync.prev_timed_out = true;
+                return Err(HardwareError::Timeout);
+            }
             Err(AtExchangeError::Rejected(msg)) => {
                 // Fail closed: a control char in the command body is never an I/O
-                // fault, so never reopen/retry — reject the whole command.
+                // fault, so never reopen/retry — reject the whole command. Nothing
+                // was written, so the channel's sync state is unchanged.
                 return Err(HardwareError::CommandRejected(msg));
             }
             Err(AtExchangeError::Fatal(msg)) => return Err(HardwareError::Io(msg)),
@@ -3183,6 +3318,10 @@ where
                 reopened = true;
                 let fresh = opener.open()?;
                 *port = fresh;
+                // A fresh fd is a brand-new channel: no in-flight carryover and no
+                // observed echo on this descriptor yet. Reset so the retry exchange
+                // does not run a stale settle-drain against the new port.
+                *sync = ChannelSync::default();
                 // loop: retry the exchange once on the fresh fd
             }
         }
@@ -3353,6 +3492,7 @@ fn at_exchange<S: SerialIo>(
     port: &mut S,
     cmd: &str,
     cmd_timeout: std::time::Duration,
+    sync: &mut ChannelSync,
 ) -> Result<String, AtExchangeError> {
     // `write_all`/`flush` resolve through the `SerialIo: Write` supertrait bound;
     // only `BufRead`/`BufReader` need importing here.
@@ -3370,6 +3510,48 @@ fn at_exchange<S: SerialIo>(
         return Err(AtExchangeError::Rejected(format!(
             "AT command contains forbidden control byte 0x{b:02x} (possible multi-command injection)"
         )));
+    }
+
+    // R-A/R-B/R-E — Post-timeout settle-drain. The PREVIOUS exchange on this
+    // channel ended in `Timeout`; the modem may still emit that command's late
+    // `...\r\nOK` *after* the lock released, i.e. only now, during this exchange.
+    // R1 below is non-blocking and would run before those bytes arrive (the exact
+    // hole that lets carryover surface during our read loop). So when recovering
+    // from a timeout we first run a BOUNDED BLOCKING settle: each pass tolerates
+    // the 100 ms `TimedOut`/`WouldBlock` read timeout (does NOT stop on it) to
+    // give late bytes a brief window to arrive and be discarded; the pass ends
+    // only on a clean idle pass, EOF, or the hard `POST_TIMEOUT_SETTLE_PASSES`
+    // ceiling. Bounded so a healthy channel never reaches here and a dead channel
+    // cannot wedge (no `tcdrain`; the read timeout still bounds each read).
+    if sync.prev_timed_out {
+        let mut scratch = [0u8; 512];
+        let mut idle_passes = 0usize;
+        for _ in 0..POST_TIMEOUT_SETTLE_PASSES {
+            match port.read(&mut scratch) {
+                Ok(0) => break, // EOF — channel closed, nothing more to settle
+                Ok(_) => {
+                    // Late carryover bytes discarded; reset the idle counter and
+                    // keep settling — more of the late response may still follow.
+                    idle_passes = 0;
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    // One quiet read cycle. Two consecutive quiet cycles means the
+                    // late response has fully arrived (or never will) — stop early
+                    // so a healthy-after-timeout channel pays minimal latency.
+                    idle_passes += 1;
+                    if idle_passes >= 2 {
+                        break;
+                    }
+                }
+                // A real I/O error here is the same fd-dead class the write below
+                // would hit; surface it through the same classifier so the reopen
+                // driver can self-heal.
+                Err(e) => return Err(classify_io(e, "Settle-drain read failed")),
+            }
+        }
     }
 
     // R1 — Pre-command input drain. Discard any bytes already pending in the
@@ -3435,6 +3617,10 @@ fn at_exchange<S: SerialIo>(
                 // R2(a) — recognize and strip the command echo, anchoring capture.
                 if !echo_seen && trimmed == echo_target {
                     echo_seen = true;
+                    // Remember that this channel echoes (echo is ON). Once known,
+                    // any FUTURE exchange treats a pre-echo body/terminal line as
+                    // carryover, never as an ATE0 response (R-A pre-echo tighten).
+                    sync.ever_echoed = true;
                     continue;
                 }
 
@@ -3463,21 +3649,36 @@ fn at_exchange<S: SerialIo>(
                         continue;
                     }
                     if is_terminal {
-                        if pre_echo_noise {
-                            // Stale terminal (the crossing `...\r\nOK`). Discard;
-                            // keep reading for our real echo + response. Clear the
-                            // flag so a later bodyless reply isn't blocked.
+                        if pre_echo_noise || sync.ever_echoed {
+                            // Carryover terminal. Either we already saw stale
+                            // pre-echo content this exchange (the crossing
+                            // `...\r\nOK`), OR this channel is KNOWN to echo
+                            // (`ever_echoed`) so a terminal before our own echo is
+                            // a prior command's late `OK` by definition — the
+                            // temporal-carryover crossing this fix exists to kill.
+                            // Discard and keep reading for our real echo +
+                            // response. Clear the noise flag so a later bodyless
+                            // reply isn't blocked. (R-A: never return crossed
+                            // bytes on an echoing channel.)
                             pre_echo_noise = false;
                             continue;
                         }
-                        // No carryover seen and no echo (ATE0): after R1's drain
-                        // the buffer holds only our exchange, so this terminal is
-                        // ours — accept it (R2 degrade-safely clause).
+                        // No carryover seen and the channel has NEVER echoed
+                        // (genuine ATE0): after R1's drain the buffer holds only
+                        // our exchange, so this terminal is ours — accept it
+                        // (R2 degrade-safely clause, reachable only for echo-off).
                         response.push_str(&line);
                         return Ok(response);
                     }
-                    // Genuine pre-echo response content (ATE0 modem). Blank lines
-                    // are dropped; real content is captured.
+                    // Pre-echo non-terminal content. On a channel KNOWN to echo,
+                    // this precedes our own echo and is therefore a prior
+                    // command's late body line (carryover) — discard it (R-A).
+                    // Only on a genuinely never-echoed (ATE0) channel is it real
+                    // pre-echo response content to capture; blank lines drop.
+                    if sync.ever_echoed {
+                        pre_echo_noise = true;
+                        continue;
+                    }
                     if !trimmed.is_empty() {
                         response.push_str(&line);
                     }
@@ -4913,6 +5114,65 @@ mod tests {
     }
 
     // =========================================================================
+    // BH-04 — netdev byte counters for get_data_stats()
+    // =========================================================================
+
+    #[cfg(feature = "real-hardware")]
+    #[test]
+    fn read_netdev_byte_counters_in_parses_tx_rx() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stats = tmp.path().join("wwan0").join("statistics");
+        std::fs::create_dir_all(&stats).unwrap();
+        std::fs::write(stats.join("tx_bytes"), "445693\n").unwrap();
+        std::fs::write(stats.join("rx_bytes"), "5676000\n").unwrap();
+
+        let result = super::real_hardware::read_netdev_byte_counters_in(tmp.path(), "wwan0");
+        assert_eq!(result, Some((445693, 5676000)));
+    }
+
+    #[cfg(feature = "real-hardware")]
+    #[test]
+    fn read_netdev_byte_counters_in_returns_none_when_missing() {
+        // No statistics directory created — must degrade to None, not error.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            super::real_hardware::read_netdev_byte_counters_in(tmp.path(), "wwan0"),
+            None
+        );
+    }
+
+    #[cfg(feature = "real-hardware")]
+    #[test]
+    fn read_netdev_byte_counters_in_returns_none_on_unparseable() {
+        // A garbage tx_bytes value must not panic — returns None.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stats = tmp.path().join("usb0").join("statistics");
+        std::fs::create_dir_all(&stats).unwrap();
+        std::fs::write(stats.join("tx_bytes"), "not-a-number\n").unwrap();
+        std::fs::write(stats.join("rx_bytes"), "1234\n").unwrap();
+        assert_eq!(
+            super::real_hardware::read_netdev_byte_counters_in(tmp.path(), "usb0"),
+            None
+        );
+    }
+
+    #[cfg(feature = "real-hardware")]
+    #[test]
+    fn read_netdev_byte_counters_works_for_ecm_naming() {
+        // Mode-agnostic: same code path for an ECM-style "usb0" interface as for
+        // a QMI-style "wwan0" — no branching on usbnet mode.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stats = tmp.path().join("usb0").join("statistics");
+        std::fs::create_dir_all(&stats).unwrap();
+        std::fs::write(stats.join("tx_bytes"), "0").unwrap();
+        std::fs::write(stats.join("rx_bytes"), "42").unwrap();
+        assert_eq!(
+            super::real_hardware::read_netdev_byte_counters_in(tmp.path(), "usb0"),
+            Some((0, 42))
+        );
+    }
+
+    // =========================================================================
     // F1 — stale serial fd self-heal (Layer 1)
     //
     // These tests run in CI under default (mock-hardware) features: the
@@ -5087,6 +5347,7 @@ mod tests {
             &mut opener,
             "AT+CSQ",
             std::time::Duration::from_secs(1),
+            &mut super::ChannelSync::default(),
         );
 
         assert_eq!(opener.open_calls, 1, "must reopen exactly once");
@@ -5109,6 +5370,7 @@ mod tests {
             &mut opener,
             "AT+CSQ",
             std::time::Duration::from_secs(1),
+            &mut super::ChannelSync::default(),
         );
 
         assert_eq!(opener.open_calls, 1, "exactly one reopen attempt, no second");
@@ -5128,6 +5390,7 @@ mod tests {
             &mut opener,
             "AT+CSQ",
             std::time::Duration::from_millis(100),
+            &mut super::ChannelSync::default(),
         );
 
         assert_eq!(opener.open_calls, 0, "TimedOut must never reopen");
@@ -5148,6 +5411,7 @@ mod tests {
             &mut opener,
             "AT+CSQ",
             std::time::Duration::from_secs(1),
+            &mut super::ChannelSync::default(),
         );
 
         assert_eq!(opener.open_calls, 0, "healthy path must not reopen");
@@ -5170,6 +5434,7 @@ mod tests {
             &mut opener,
             "AT+CFUN=1\rAT+QFASTBOOT",
             std::time::Duration::from_secs(1),
+            &mut super::ChannelSync::default(),
         );
 
         assert!(
@@ -5195,6 +5460,7 @@ mod tests {
             &mut opener,
             "AT+CFUN=1\nAT+QFASTBOOT",
             std::time::Duration::from_secs(1),
+            &mut super::ChannelSync::default(),
         );
 
         assert!(
@@ -5221,6 +5487,7 @@ mod tests {
             &mut opener,
             cmd,
             std::time::Duration::from_secs(1),
+            &mut super::ChannelSync::default(),
         );
 
         let resp = result.expect("legitimate command must succeed");
@@ -5570,7 +5837,25 @@ mod tests {
     impl super::SerialIo for FramingSerial {}
 
     fn exch(port: &mut FramingSerial, cmd: &str) -> Result<String, super::AtExchangeError> {
-        super::at_exchange(port, cmd, std::time::Duration::from_secs(1))
+        // Single, fresh-channel exchange: no prior-timeout carryover, echo not yet
+        // observed. Preserves the original framing-test behavior exactly.
+        super::at_exchange(
+            port,
+            cmd,
+            std::time::Duration::from_secs(1),
+            &mut super::ChannelSync::default(),
+        )
+    }
+
+    /// Like `exch` but threads a caller-owned `ChannelSync` so a test can model
+    /// CONSECUTIVE exchanges on the same channel (post-timeout settle-drain +
+    /// observed-echo carry across calls). Used by the carryover-crossing tests.
+    fn exch_sync(
+        port: &mut FramingSerial,
+        cmd: &str,
+        sync: &mut super::ChannelSync,
+    ) -> Result<String, super::AtExchangeError> {
+        super::at_exchange(port, cmd, std::time::Duration::from_secs(1), sync)
     }
 
     // --- R1: pre-command input drain ----------------------------------------
@@ -5693,5 +5978,381 @@ mod tests {
         assert!(!resp.contains("+CREG"), "URC filtered, got {resp:?}");
         assert!(!resp.contains("+QIND"), "URC filtered, got {resp:?}");
         assert!(!resp.contains("+CGEV"), "URC filtered, got {resp:?}");
+    }
+
+    // =========================================================================
+    // AT-channel POST-TIMEOUT response carryover — read-framing hardening
+    // (2026-06-22 spec, follow-up to dev.57). R-A no crossing · R-B auto-recover
+    // · R-E bounded settle-drain. Carryover is TEMPORAL (across the lock boundary
+    // after a Timeout), NOT byte-interleaving — see at_exchange / ChannelSync.
+    // =========================================================================
+
+    /// A scripted fake that models a FULL two-exchange temporal carryover on one
+    /// channel. Exchange 1 (command A) writes and only ever reads `TimedOut`
+    /// (A's response has not arrived yet → the exchange times out, the lock is
+    /// released). Command A's late response then becomes readable, modelling the
+    /// modem emitting it AFTER the lock boundary. Exchange 2 (command B) writes;
+    /// its own echo + real response (`b_after`) follow.
+    ///
+    /// The key fidelity: A's late bytes are NOT readable during exchange 1 (so it
+    /// genuinely times out) and are served at the START of exchange 2's reads
+    /// (where, untreated, they would cross into B's read loop before B's echo).
+    struct CarryoverSerial {
+        /// Command A's late response, served only once exchange 2 begins reading.
+        a_late: Vec<u8>,
+        a_late_pos: usize,
+        /// Command B's echo + real response + terminal, served after `a_late`.
+        b_after: Vec<u8>,
+        b_after_pos: usize,
+        /// Number of writes seen so far (1 = A written, 2 = B written).
+        writes: usize,
+        write_log: Vec<u8>,
+    }
+
+    impl CarryoverSerial {
+        fn new(a_late: &str, b_after: &str) -> Self {
+            CarryoverSerial {
+                a_late: a_late.as_bytes().to_vec(),
+                a_late_pos: 0,
+                b_after: b_after.as_bytes().to_vec(),
+                b_after_pos: 0,
+                writes: 0,
+                write_log: Vec::new(),
+            }
+        }
+        fn serve(buf: &mut [u8], src: &[u8], pos: &mut usize) -> io::Result<usize> {
+            let remaining = &src[*pos..];
+            let n = remaining.len().min(buf.len());
+            buf[..n].copy_from_slice(&remaining[..n]);
+            *pos += n;
+            Ok(n)
+        }
+    }
+
+    impl Read for CarryoverSerial {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            // During exchange 1 (only A written): A's response is "not here yet".
+            if self.writes < 2 {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "A not yet replied"));
+            }
+            // Exchange 2: serve A's late carryover first (this is what the settle-
+            // drain must discard), then B's real exchange bytes.
+            if self.a_late_pos < self.a_late.len() {
+                return Self::serve(buf, &self.a_late, &mut self.a_late_pos);
+            }
+            if self.b_after_pos < self.b_after.len() {
+                return Self::serve(buf, &self.b_after, &mut self.b_after_pos);
+            }
+            Err(io::Error::new(io::ErrorKind::TimedOut, "fake idle"))
+        }
+    }
+
+    impl Write for CarryoverSerial {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            self.write_log.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl super::SerialIo for CarryoverSerial {}
+
+    #[test]
+    fn carryover_timed_out_command_does_not_become_next_commands_value() {
+        // R-A core repro. Command A (a slow AT+QENG) times out; the lock releases;
+        // A's late `+QENG: ...\r\nOK` then arrives and front-loads command B's
+        // (AT+QUIMSLOT?) read stream BEFORE B's own echo. B must return ITS OWN
+        // +QUIMSLOT response, never A's carried-over +QENG reply.
+        let mut port = CarryoverSerial::new(
+            // A's late response (arrives after A's lock released):
+            "AT+QENG=\"servingcell\"\r\r\n+QENG: \"servingcell\",\"NOCONN\"\r\nOK\r\n",
+            // B's real exchange: its own echo + response + terminal:
+            "AT+QUIMSLOT?\r\r\n+QUIMSLOT: 1\r\nOK\r\n",
+        );
+        // Realistic deployment state: the channel echoes (ON) and has been
+        // observed echoing on a prior boot/discovery exchange. The daemon never
+        // issues ATE0, so this is always true by the time any command can time out.
+        let mut sync = super::ChannelSync { prev_timed_out: false, ever_echoed: true };
+
+        // Exchange 1 (A) — times out (A's reply not yet available). This is the
+        // event that arms the channel for carryover recovery.
+        let a = drive(
+            &mut port,
+            "AT+QENG=\"servingcell\"",
+            std::time::Duration::from_millis(150),
+            &mut sync,
+        );
+        assert!(
+            matches!(a, Err(super::HardwareError::Timeout)),
+            "command A must time out (its reply has not arrived yet), got {a:?}"
+        );
+        assert!(
+            sync.prev_timed_out,
+            "a timed-out exchange must arm the next exchange's settle-drain (R-B)"
+        );
+
+        // Exchange 2 (B) — must return ITS OWN response, never A's late +QENG.
+        let b = drive(&mut port, "AT+QUIMSLOT?", std::time::Duration::from_secs(1), &mut sync)
+            .expect("command B must succeed and recover the channel");
+        assert!(
+            b.contains("+QUIMSLOT: 1"),
+            "B must return its own QUIMSLOT response, got {b:?}"
+        );
+        assert!(
+            !b.contains("+QENG"),
+            "A's late response must NOT cross into B (R-A), got {b:?}"
+        );
+        assert!(
+            !sync.prev_timed_out,
+            "a clean exchange must clear the carryover arm (R-B auto-recover)"
+        );
+    }
+
+    #[test]
+    fn carryover_bare_at_echo_crossing_returns_quimslot_not_bare_at() {
+        // The exact bench observation: a manual AT+QUIMSLOT? returned a bare `AT`
+        // echo. Model the prior command's late `AT\r\r\nOK` (a bare-AT health
+        // check that timed out) crossing into AT+QUIMSLOT?'s stream before its
+        // echo. The result must be the real +QUIMSLOT response, never bare `AT`
+        // and never a bodyless OK.
+        let mut port = CarryoverSerial::new(
+            "AT\r\r\nOK\r\n", // prior bare-AT's late echo+terminal
+            "AT+QUIMSLOT?\r\r\n+QUIMSLOT: 1\r\nOK\r\n",
+        );
+        // Deployment channel: echo ON, observed before (see test above).
+        let mut sync = super::ChannelSync { prev_timed_out: false, ever_echoed: true };
+
+        let a = drive(
+            &mut port,
+            "AT",
+            std::time::Duration::from_millis(150),
+            &mut sync,
+        );
+        assert!(matches!(a, Err(super::HardwareError::Timeout)), "bare AT must time out, got {a:?}");
+
+        let b = drive(&mut port, "AT+QUIMSLOT?", std::time::Duration::from_secs(1), &mut sync)
+            .expect("AT+QUIMSLOT? must succeed");
+        assert!(
+            b.contains("+QUIMSLOT: 1"),
+            "must return the real QUIMSLOT response, never bare AT/bodyless OK, got {b:?}"
+        );
+        assert_ne!(b.trim(), "AT", "must never return the crossed bare-AT echo");
+        assert_ne!(b.trim(), "OK", "must never return a crossed bodyless OK");
+    }
+
+    #[test]
+    fn carryover_pre_echo_terminal_discarded_on_echoing_channel() {
+        // Mitigation 2 in isolation (no settle-drain involved): on a channel KNOWN
+        // to echo, a terminal/body line arriving BEFORE our own echo is carryover
+        // by definition and must be discarded — the ATE0 degrade-accept clause
+        // must NOT fire. We pre-set `ever_echoed` (as a prior clean exchange would)
+        // and front-load a stale `+QUIMSLOT: 9\r\nOK` before B's echo.
+        let mut port = FramingSerial::new(
+            "",
+            // stale crossover (NO leading AT echo, so only mitigation 2 can catch
+            // it — pre_echo_noise is never set by an `AT...` line here), then ours:
+            "+QUIMSLOT: 9\r\nOK\r\n\
+             AT+QUIMSLOT?\r\r\n+QUIMSLOT: 1\r\nOK\r\n",
+        );
+        let mut sync = super::ChannelSync { prev_timed_out: false, ever_echoed: true };
+
+        let resp = exch_sync(&mut port, "AT+QUIMSLOT?", &mut sync)
+            .expect("exchange should succeed");
+        assert!(
+            resp.contains("+QUIMSLOT: 1"),
+            "must return our own response, got {resp:?}"
+        );
+        assert!(
+            !resp.contains("+QUIMSLOT: 9"),
+            "stale pre-echo body must be discarded on an echoing channel (R-A), got {resp:?}"
+        );
+    }
+
+    #[test]
+    fn carryover_clean_back_to_back_adds_no_settle_and_returns_promptly() {
+        // R-E: when the previous exchange did NOT time out, the settle-drain must
+        // not run at all. Two clean back-to-back exchanges on one channel both
+        // return their own responses, and the carryover arm stays clear throughout.
+        let mut sync = super::ChannelSync::default();
+
+        let mut p1 = FramingSerial::new("", "AT+CSQ\r\r\n+CSQ: 20,99\r\nOK\r\n");
+        let r1 = exch_sync(&mut p1, "AT+CSQ", &mut sync).expect("first exchange ok");
+        assert!(r1.contains("+CSQ: 20,99"), "got {r1:?}");
+        assert!(!sync.prev_timed_out, "clean exchange must not arm the settle-drain");
+        assert!(sync.ever_echoed, "channel observed its own echo");
+
+        let mut p2 = FramingSerial::new("", "AT+CPIN?\r\r\n+CPIN: READY\r\nOK\r\n");
+        let r2 = exch_sync(&mut p2, "AT+CPIN?", &mut sync).expect("second exchange ok");
+        assert!(r2.contains("+CPIN: READY"), "got {r2:?}");
+        assert!(!sync.prev_timed_out, "still no carryover arm after a clean run");
+    }
+
+    #[test]
+    fn carryover_ate0_never_echoed_still_returns_bodyless_ok() {
+        // R-C guard: a genuine ATE0 (never-echoed) modem must still degrade safely.
+        // With `ever_echoed=false` and no carryover, a bodyless OK with no echo is
+        // accepted as ours (the degrade clause stays reachable for echo-off).
+        let mut port = FramingSerial::new("", "OK\r\n");
+        let mut sync = super::ChannelSync::default();
+        let resp = exch_sync(&mut port, "AT+CFUN=1", &mut sync)
+            .expect("ATE0 bodyless exchange should succeed");
+        assert!(resp.contains("OK"), "bodyless OK accepted for echo-off modem, got {resp:?}");
+        assert!(!sync.ever_echoed, "never-echoed channel must NOT be marked as echoing");
+    }
+
+    /// A `PortOpener` that never opens: the carryover path is pure read-framing
+    /// (no fd-dead I/O error), so a Reopenable is never produced. If one ever
+    /// were, this fails the open and the test would surface it. Generic over the
+    /// port type so it drives any of the framing fakes through the real driver
+    /// (`run_at_command_with_reopen`), which is what manages the `prev_timed_out`
+    /// arm lifecycle in production.
+    struct NoReopenOpener<P>(std::marker::PhantomData<P>);
+    impl<P: super::SerialIo> super::PortOpener for NoReopenOpener<P> {
+        type Port = P;
+        fn open(&mut self) -> super::HardwareResult<P> {
+            Err(super::HardwareError::DeviceNotFound(
+                "carryover test: no reopen expected".into(),
+            ))
+        }
+    }
+
+    /// Drive one command through the REAL driver over a generic framing fake,
+    /// threading a caller-owned `ChannelSync`. Uses `run_at_command_with_reopen`
+    /// so the post-timeout arm (set on Timeout, cleared on a clean Ok) is
+    /// exercised end-to-end, exactly as `send_command` does in production.
+    fn drive<P: super::SerialIo>(
+        port: &mut P,
+        cmd: &str,
+        cmd_timeout: std::time::Duration,
+        sync: &mut super::ChannelSync,
+    ) -> super::HardwareResult<String> {
+        let mut opener = NoReopenOpener::<P>(std::marker::PhantomData);
+        super::run_at_command_with_reopen(port, &mut opener, cmd, cmd_timeout, sync)
+    }
+
+    /// A fake that makes the timed-out command's late response available DURING
+    /// the post-timeout settle-drain window (i.e. before the next command is
+    /// written), then — after the next write — serves that command's own clean
+    /// exchange. This isolates mitigation 1 (the settle-drain): the late bytes are
+    /// gone before the read loop even starts, so only a BLOCKING settle could have
+    /// caught them (R1's non-blocking sweep would still have to be lucky on timing).
+    struct SettleDrainSerial {
+        /// Late carryover bytes. Modelled as "in flight": NOT available on the
+        /// first read (so R1's non-blocking sweep, which stops on the first
+        /// TimedOut, misses them) — they only become readable from the second
+        /// read onward, which only the blocking settle-drain (it tolerates
+        /// TimedOut and keeps polling) can catch.
+        settle: Vec<u8>,
+        settle_pos: usize,
+        /// Reads taken before the write — used to delay `settle` past read #1.
+        pre_write_reads: usize,
+        /// The next command's real exchange, readable only after its write.
+        after: Vec<u8>,
+        after_pos: usize,
+        wrote: bool,
+        write_log: Vec<u8>,
+    }
+
+    impl SettleDrainSerial {
+        fn new(settle: &str, after: &str) -> Self {
+            SettleDrainSerial {
+                settle: settle.as_bytes().to_vec(),
+                settle_pos: 0,
+                pre_write_reads: 0,
+                after: after.as_bytes().to_vec(),
+                after_pos: 0,
+                wrote: false,
+                write_log: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for SettleDrainSerial {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if !self.wrote {
+                self.pre_write_reads += 1;
+                // Read #1: late bytes have "not arrived yet" → TimedOut. This is
+                // exactly where R1's non-blocking drain gives up (it stops on the
+                // first TimedOut), proving R1 alone cannot catch in-flight late
+                // bytes. The blocking settle-drain keeps polling past this.
+                if self.pre_write_reads == 1 {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "late bytes in flight"));
+                }
+                // Read #2+: the late carryover has now arrived; serve + discard it.
+                if self.settle_pos < self.settle.len() {
+                    let remaining = &self.settle[self.settle_pos..];
+                    let n = remaining.len().min(buf.len());
+                    buf[..n].copy_from_slice(&remaining[..n]);
+                    self.settle_pos += n;
+                    return Ok(n);
+                }
+                // Late bytes fully delivered; channel is now quiet pre-write.
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "quiet pre-write"));
+            }
+            // After the write: if the settle-drain did NOT consume the late bytes
+            // (mitigation 1 absent), they are STILL on the wire and now cross into
+            // the read loop — exactly the carryover defect. Serve any remainder
+            // here so the test fails without the fix.
+            if self.settle_pos < self.settle.len() {
+                let remaining = &self.settle[self.settle_pos..];
+                let n = remaining.len().min(buf.len());
+                buf[..n].copy_from_slice(&remaining[..n]);
+                self.settle_pos += n;
+                return Ok(n);
+            }
+            if self.after_pos < self.after.len() {
+                let remaining = &self.after[self.after_pos..];
+                let n = remaining.len().min(buf.len());
+                buf[..n].copy_from_slice(&remaining[..n]);
+                self.after_pos += n;
+                return Ok(n);
+            }
+            Err(io::Error::new(io::ErrorKind::TimedOut, "fake idle"))
+        }
+    }
+
+    impl Write for SettleDrainSerial {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.wrote = true;
+            self.write_log.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl super::SerialIo for SettleDrainSerial {}
+
+    #[test]
+    fn carryover_settle_drain_discards_late_response_before_next_command() {
+        // Mitigation 1 isolated. The previous exchange timed out (arm set). A's
+        // late `+QENG ...\r\nOK` is sitting on the wire when B begins; the bounded
+        // BLOCKING settle-drain must consume + discard it before B is written, so
+        // B's own +QUIMSLOT response is the only thing the read loop ever sees.
+        let mut port = SettleDrainSerial::new(
+            "+QENG: \"servingcell\",\"NOCONN\"\r\nOK\r\n", // A's late tail (no AT echo)
+            "AT+QUIMSLOT?\r\r\n+QUIMSLOT: 1\r\nOK\r\n",     // B's own exchange
+        );
+        // Deliberately `ever_echoed=false` so mitigation 2 (pre-echo tighten) is
+        // INERT and only the settle-drain (mitigation 1) can keep A's late
+        // `+QENG` body out of B's response. This isolates mitigation 1.
+        let mut sync = super::ChannelSync { prev_timed_out: true, ever_echoed: false };
+
+        let resp = drive(&mut port, "AT+QUIMSLOT?", std::time::Duration::from_secs(1), &mut sync)
+            .expect("settle-drain recovery exchange should succeed");
+
+        assert!(
+            resp.contains("+QUIMSLOT: 1"),
+            "B's own response must be returned, got {resp:?}"
+        );
+        assert!(
+            !resp.contains("+QENG"),
+            "A's late response must be settle-drained, never returned (R-A), got {resp:?}"
+        );
+        assert!(!sync.prev_timed_out, "clean exchange clears the arm (R-B)");
     }
 }

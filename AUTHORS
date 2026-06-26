@@ -1,0 +1,13 @@
+CTRL-Modem — AUTHORS
+====================
+
+Design, product direction, hardware & connectivity guidance, and testing:
+  Didney (DidneyWhorl)
+
+Implementation (all source code):
+  Claude — Anthropic
+  https://www.anthropic.com
+
+CTRL-Modem was designed and directed by Didney; its source code was written
+entirely by Claude (Anthropic's AI assistant), with other LLMs contributing
+occasionally. See "A Note From Didney" in README.md for the full story.
