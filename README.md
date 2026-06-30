@@ -1,5 +1,7 @@
 # CTRL-Modem
 
+**Talk about it on Discord here: https://discord.gg/b8qJC3NKv**
+
 **A modern web UI for cellular modems on OpenWRT. Does not work inside LuCI, so you don't need LuCI installed.**
 
 CTRL-Modem is a standalone web interface for managing cellular (4G/5G) modems on
@@ -11,8 +13,6 @@ modem from a single screen.
 <!-- TODO: add docs/assets/ui.gif -->
 
 ## A Note From Didney
-
-**Talk about it on Discord here: https://discord.gg/b8qJC3NKv**
 
 **Full transparency up front.**
 
