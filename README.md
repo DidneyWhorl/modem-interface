@@ -12,6 +12,8 @@ modem from a single screen.
 
 ## A Note From Didney
 
+**Talk about it on Discord here: https://discord.gg/b8qJC3NKv**
+
 **Full transparency up front.**
 
 Didney here. I want to be sure there is no confusion on this project, as I
